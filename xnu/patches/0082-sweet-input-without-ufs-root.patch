@@ -1,0 +1,56 @@
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,11 @@
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++	/* keys, touch and usb start from sweet_ufs_init, so start them here for rd=md0 */
++	{
++		extern void sweet_input_start(void);
++		sweet_input_start();
++	}
+ #endif
+ 
+ //
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..7efbde1 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -583,6 +583,24 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++/* also called by IOFindBSDRoot for a non ufs root, so only once */
++void sweet_input_start(void);
++
++void
++sweet_input_start(void)
++{
++	static bool started;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
++	sweet_keys_init();
++	sweet_touch_init();
++	sweet_usb_probe();
++}
++
+ static int
+ sweet_ufs_init(void)
+ {
+@@ -656,10 +674,7 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+-	sweet_keys_init();
+-	sweet_touch_init();
+-	sweet_usb_probe();
++	sweet_input_start();
+ 	return 0;
+ }
+ 
