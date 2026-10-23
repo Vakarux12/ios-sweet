@@ -1,0 +1,103 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6aedb34..251da34 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,8 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <mach/host_info.h>
++#include <mach/machine.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -194,8 +196,8 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	/* the cpu copy costs a core at 60 Hz, the gpu copy about 2 ms of gpu time */
+-	uint32_t hz = a71gpu_init() ? 30 : 10;
++	/* the cpu copy costs a core at 60 Hz, the gpu copy about 3 ms */
++	uint32_t hz = a71gpu_init() ? 60 : 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -209,12 +211,50 @@ AppleCLCD::start(IOService *provider)
+ 	return true;
+ }
+ 
++extern "C" host_priv_t host_priv_self(void);
++extern "C" kern_return_t host_statistics(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
++
++/* every 5 s while ios swaps: frames in, frames shown, gpu copy time, cpu load */
++static struct {
++	uint32_t swaps, presents, gpuN;
++	uint64_t gpuUS, gpuMax;
++	host_cpu_load_info_data_t cpu;
++} sweet_perf;
++
++static void
++sweet_perf_log(void)
++{
++	host_cpu_load_info_data_t cpu;
++	mach_msg_type_number_t n = HOST_CPU_LOAD_INFO_COUNT;
++	if (host_statistics((host_t)host_priv_self(), HOST_CPU_LOAD_INFO, (host_info_t)&cpu, &n) != KERN_SUCCESS) {
++		return;
++	}
++	uint32_t t[CPU_STATE_MAX], all = 0;
++	for (int i = 0; i < CPU_STATE_MAX; i++) {
++		t[i] = cpu.cpu_ticks[i] - sweet_perf.cpu.cpu_ticks[i];
++		all += t[i];
++	}
++	bool first = sweet_perf.cpu.cpu_ticks[CPU_STATE_IDLE] == 0;
++	sweet_perf.cpu = cpu;
++	if (!first && sweet_perf.swaps != 0 && all != 0) {
++		IOLog("SWEET PERF: 5 s %u swaps %u shown, gpu avg %llu max %llu us, cpu user %u sys %u idle %u %%\n",
++		    sweet_perf.swaps, sweet_perf.presents, sweet_perf.gpuN ? sweet_perf.gpuUS / sweet_perf.gpuN : 0,
++		    sweet_perf.gpuMax, 100 * t[CPU_STATE_USER] / all, 100 * t[CPU_STATE_SYSTEM] / all,
++		    100 * t[CPU_STATE_IDLE] / all);
++	}
++	sweet_perf.swaps = sweet_perf.presents = sweet_perf.gpuN = 0;
++	sweet_perf.gpuUS = sweet_perf.gpuMax = 0;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (count % 300 == 0) {
++		sweet_perf_log();
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -256,6 +296,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		sweet_perf.presents++;
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+@@ -571,6 +612,11 @@ a71gpu_present(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy, int32_t d
+ 	uint64_t ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	a71gpu.lastUS = ns / 1000;
++	sweet_perf.gpuN++;
++	sweet_perf.gpuUS += a71gpu.lastUS;
++	if (a71gpu.lastUS > sweet_perf.gpuMax) {
++		sweet_perf.gpuMax = a71gpu.lastUS;
++	}
+ 	if (a71gpu.presents++ % 1000 == 0) {
+ 		IOLog("SWEET GPU: present %llu took %llu us (clean, copy, wait)\n", a71gpu.presents, a71gpu.lastUS);
+ 	}
+@@ -590,6 +636,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	sweet_perf.swaps++;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
