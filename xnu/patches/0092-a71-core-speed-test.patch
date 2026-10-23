@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..bb6d4d2 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -11,6 +11,7 @@
+  * syscall stub in pc and its caller in lr/bt.
+  *
+  * First sample 90 s after start, then every 120 s, 40 samples at most.
++ * At 20 s it logs the real clock and copy speed of every core (SWEET SPEED).
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -19,6 +20,9 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -45,6 +49,45 @@ sweet_sample_wanted(const char *name)
+ }
+ 
+ extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++extern processor_t cpu_to_processor(int cpu);
++extern processor_t thread_bind(processor_t processor);
++
++static uint64_t
++sweet_speed_ns(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns ? ns : 1;
++}
++
++/* dependent adds retire one per cycle on both the a55 and the a76 */
++static void
++sweet_speed(void)
++{
++	size_t sz = 8u << 20;
++	char *a = kalloc_data(2 * sz, Z_WAITOK | Z_ZERO);
++	for (int c = 0; c <= ml_get_max_cpu_number(); c++) {
++		thread_bind(cpu_to_processor(c));
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t mpidr, n = 1000000, x = 0, mbs = 0, t = mach_absolute_time();
++		__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
++		__asm__ volatile ("1:\n.rept 16\nadd %1, %1, #1\n.endr\nsubs %0, %0, #1\nb.ne 1b" : "+r"(n), "+r"(x));
++		uint64_t mhz = 16000000000ULL / sweet_speed_ns(t);
++		if (a) {
++			t = mach_absolute_time();
++			for (int i = 0; i < 4; i++) {
++				memcpy(a + sz, a, sz);
++			}
++			mbs = 4000ULL * sz / sweet_speed_ns(t);
++		}
++		printf("SWEET SPEED: cpu %d mpidr 0x%llx %llu MHz, memcpy %llu MB/s\n", c, mpidr & 0xffffff, mhz, mbs);
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++	if (a) {
++		kfree_data(a, 2 * sz);
++	}
++}
+ 
+ static int
+ sweet_sample_proc(proc_t p, __unused void *arg)
+@@ -70,7 +113,9 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
++	(void)tsleep(&chan, PZERO, "sweetsmp", 20 * hz);
++	sweet_speed();
++	(void)tsleep(&chan, PZERO, "sweetsmp", 70 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
