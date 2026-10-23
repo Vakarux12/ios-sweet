@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..7b1e46e 100644
+index a62416c..6aedb34 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -25,7 +25,7 @@
@@ -11,18 +11,26 @@ index a62416c..7b1e46e 100644
   * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
   * enabled it, through the port they registered (IOConnectSetNotificationPort).
   *
-@@ -192,7 +192,9 @@ AppleCLCD::start(IOService *provider)
+@@ -149,6 +149,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++static bool a71gpu_init(void);
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -192,7 +194,8 @@ AppleCLCD::start(IOService *provider)
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
 -	uint32_t hz = 10;
-+	a71gpu_init();
 +	/* the cpu copy costs a core at 60 Hz, the gpu copy about 2 ms of gpu time */
-+	uint32_t hz = a71gpu.ready ? 30 : 10;
++	uint32_t hz = a71gpu_init() ? 30 : 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -289,6 +291,290 @@ get32(const uint8_t *p, uint32_t off)
+@@ -289,6 +292,291 @@ get32(const uint8_t *p, uint32_t off)
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -115,26 +123,26 @@ index a62416c..7b1e46e 100644
 +	}
 +}
 +
-+static void
++static bool
 +a71gpu_init(void)
 +{
 +	int mode = 0;
 +	if (!PE_parse_boot_argn("a71gpu", &mode, sizeof(mode)) || mode != 4) {
-+		return;
++		return false;
 +	}
 +	a71gpu.ram = ml_io_map(A71GPU_RAM_PA, A71GPU_RAM_SIZE);
 +	a71gpu.regs = (volatile uint32_t *)ml_io_map(0x05000000, 0x10000);
 +	a71gpu.cb0 = (volatile uint32_t *)ml_io_map(0x05048000, 0x1000);
 +	if (a71gpu.ram == 0 || a71gpu.regs == NULL || a71gpu.cb0 == NULL) {
 +		IOLog("SWEET GPU: no mappings\n");
-+		return;
++		return false;
 +	}
 +	volatile uint32_t *scr = (volatile uint32_t *)(a71gpu.ram + A71GPU_SCR);
 +	uint32_t rptr = a71gpu.regs[0x806], wptr = a71gpu.regs[0x807];
 +	IOLog("SWEET GPU: handoff 0x%x wptr %u/%u rptr %u rbbm 0x%x\n", scr[0x10], scr[0x11],
 +	    wptr, rptr, a71gpu.regs[0x210]);
 +	if (scr[0x10] != A71GPU_READY_MAGIC || scr[0x11] != wptr || rptr != wptr) {
-+		return;
++		return false;
 +	}
 +	/* gpu va 0xc0000000 (l1[3]) -> surface l2 -> one l3 table per 2 mb */
 +	volatile uint64_t *l2 = (volatile uint64_t *)(a71gpu.ram + A71GPU_L2S);
@@ -149,6 +157,7 @@ index a62416c..7b1e46e 100644
 +	a71gpu.wptr = wptr;
 +	a71gpu.fence = scr[0x20];
 +	a71gpu.ready = true;
++	return true;
 +}
 +
 +/* context bank 0 tlb invalidate all, then sync */
@@ -313,7 +322,7 @@ index a62416c..7b1e46e 100644
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -390,6 +676,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -390,6 +678,9 @@ AppleCLCD::present(const uint8_t *rec)
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
