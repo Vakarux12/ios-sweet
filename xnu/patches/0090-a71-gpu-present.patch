@@ -1,0 +1,325 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..7b1e46e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,7 @@
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
++ * scaling, CPU copy, or the Adreno 2D engine on a71 with a71gpu=4). Vsync (notification type 5) is a 60 Hz timer that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -192,7 +192,9 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	a71gpu_init();
++	/* the cpu copy costs a core at 60 Hz, the gpu copy about 2 ms of gpu time */
++	uint32_t hz = a71gpu.ready ? 30 : 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -289,6 +291,290 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * a71 (boot-arg a71gpu=4): the shim leaves the Adreno 618 running (GMU,
++ * zap shader, CP out of secure mode, see shim/gpu.c) and present() copies
++ * through its 2D engine (CP_BLIT, like freedreno's fd6 blitter) instead of
++ * memcpy, about 2 ms of GPU time per 1080x2400 frame. Everything lives in
++ * low RAM that XNU does not own: ring 0xf0180000 (GPU VA 0x60180000),
++ * scratch 0xf01c0000, SMMU tables 0xf0200000 (context bank 0, shared with
++ * the GMU), surface L3 tables 0xf0400000. The panel memory is mapped 1:1,
++ * surfaces get a 16 MB slot at GPU VA 0xc0000000 each. The panel pitch
++ * (4320) is not a multiple of 64, so every copy is two blits with doubled
++ * pitches (even and odd rows). Any timeout falls back to the CPU copy.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
++
++#define A71GPU_RAM_PA           0xf0000000ULL
++#define A71GPU_RAM_SIZE         0x500000
++#define A71GPU_RING             0x180000        /* offsets into the RAM window */
++#define A71GPU_RING_DW          8192
++#define A71GPU_SCR              0x1c0000
++#define A71GPU_SCR_VA           0x601c0000u
++#define A71GPU_READY_MAGIC      0x47505534u     /* written by the shim at scratch + 0x40 */
++#define A71GPU_L1               0x200000
++#define A71GPU_L2S              0x203000
++#define A71GPU_L3               0x400000
++#define A71GPU_SLOTS            4
++#define A71GPU_SLOT_VA          0xc0000000u
++#define A71GPU_SLOT_SIZE        0x1000000u
++#define A71GPU_PTE              (1u << 10 | 2u << 8 | 1u << 6)  /* af, outer shareable, rw, attr 0 */
++
++static struct {
++	bool                  ready;
++	volatile uint32_t    *regs;
++	volatile uint32_t    *cb0;
++	uintptr_t             ram;
++	uint32_t              wptr, fence, next;
++	uint64_t              presents, lastUS;
++	IOMemoryDescriptor   *slotMem[A71GPU_SLOTS];
++	addr64_t              slotPA[A71GPU_SLOTS];
++	uint32_t              slotPages[A71GPU_SLOTS];
++} a71gpu;
++
++static uint32_t
++a71gpu_parity(uint32_t v)
++{
++	v ^= v >> 16;
++	v ^= v >> 8;
++	v ^= v >> 4;
++	return 0x9669 >> (v & 0xf) & 1;
++}
++
++static void
++a71gpu_out(uint32_t v)
++{
++	((volatile uint32_t *)(a71gpu.ram + A71GPU_RING))[a71gpu.wptr++ & (A71GPU_RING_DW - 1)] = v;
++}
++
++static void
++a71gpu_pkt7(uint32_t op, uint32_t cnt)
++{
++	a71gpu_out(0x70000000u | cnt | a71gpu_parity(cnt) << 15 | op << 16 | a71gpu_parity(op) << 23);
++}
++
++static void
++a71gpu_pkt4(uint32_t reg, uint32_t cnt)
++{
++	a71gpu_out(0x40000000u | cnt | a71gpu_parity(cnt) << 7 | reg << 8 | a71gpu_parity(reg) << 27);
++}
++
++static void
++a71gpu_reg(uint32_t reg, uint32_t v)
++{
++	a71gpu_pkt4(reg, 1);
++	a71gpu_out(v);
++}
++
++/* CP_EVENT_WRITE, the _TS events also write a timestamp to scratch + 0x90 */
++static void
++a71gpu_event(uint32_t ev, bool ts)
++{
++	a71gpu_pkt7(0x46, ts ? 4 : 1);
++	a71gpu_out(ev | (ts ? 1u << 30 : 0));
++	if (ts) {
++		a71gpu_out(A71GPU_SCR_VA + 0x90);
++		a71gpu_out(0);
++		a71gpu_out(ev);
++	}
++}
++
++static void
++a71gpu_init(void)
++{
++	int mode = 0;
++	if (!PE_parse_boot_argn("a71gpu", &mode, sizeof(mode)) || mode != 4) {
++		return;
++	}
++	a71gpu.ram = ml_io_map(A71GPU_RAM_PA, A71GPU_RAM_SIZE);
++	a71gpu.regs = (volatile uint32_t *)ml_io_map(0x05000000, 0x10000);
++	a71gpu.cb0 = (volatile uint32_t *)ml_io_map(0x05048000, 0x1000);
++	if (a71gpu.ram == 0 || a71gpu.regs == NULL || a71gpu.cb0 == NULL) {
++		IOLog("SWEET GPU: no mappings\n");
++		return;
++	}
++	volatile uint32_t *scr = (volatile uint32_t *)(a71gpu.ram + A71GPU_SCR);
++	uint32_t rptr = a71gpu.regs[0x806], wptr = a71gpu.regs[0x807];
++	IOLog("SWEET GPU: handoff 0x%x wptr %u/%u rptr %u rbbm 0x%x\n", scr[0x10], scr[0x11],
++	    wptr, rptr, a71gpu.regs[0x210]);
++	if (scr[0x10] != A71GPU_READY_MAGIC || scr[0x11] != wptr || rptr != wptr) {
++		return;
++	}
++	/* gpu va 0xc0000000 (l1[3]) -> surface l2 -> one l3 table per 2 mb */
++	volatile uint64_t *l2 = (volatile uint64_t *)(a71gpu.ram + A71GPU_L2S);
++	for (uint32_t i = 0; i < 512; i++) {
++		l2[i] = i < A71GPU_SLOTS * 8 ? (A71GPU_RAM_PA + A71GPU_L3 + 0x1000 * i) | 3 : 0;
++	}
++	volatile uint64_t *l3 = (volatile uint64_t *)(a71gpu.ram + A71GPU_L3);
++	for (uint32_t i = 0; i < A71GPU_SLOTS * 8 * 512; i++) {
++		l3[i] = 0;
++	}
++	((volatile uint64_t *)(a71gpu.ram + A71GPU_L1))[A71GPU_SLOT_VA >> 30] = (A71GPU_RAM_PA + A71GPU_L2S) | 3;
++	a71gpu.wptr = wptr;
++	a71gpu.fence = scr[0x20];
++	a71gpu.ready = true;
++}
++
++/* context bank 0 tlb invalidate all, then sync */
++static bool
++a71gpu_tlbi(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a71gpu.cb0[0x618 / 4] = 0;
++	a71gpu.cb0[0x7f0 / 4] = 0;
++	for (int i = 0; i < 1000; i++) {
++		if (!(a71gpu.cb0[0x7f4 / 4] & 1)) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++/* gpu va of the surface memory, mapped page by page into a slot on first use */
++static uint32_t
++a71gpu_map(IOMemoryDescriptor *mem)
++{
++	IOByteCount len = mem->getLength();
++	addr64_t pa0 = mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	if (len == 0 || len > A71GPU_SLOT_SIZE || pa0 == 0) {
++		return 0;
++	}
++	for (uint32_t k = 0; k < A71GPU_SLOTS; k++) {
++		if (a71gpu.slotMem[k] == mem && a71gpu.slotPA[k] == pa0) {
++			return A71GPU_SLOT_VA + k * A71GPU_SLOT_SIZE;
++		}
++	}
++	uint32_t k = a71gpu.next++ % A71GPU_SLOTS;
++	volatile uint64_t *l3 = (volatile uint64_t *)(a71gpu.ram + A71GPU_L3 + (uint64_t)k * 8 * 0x1000);
++	uint32_t pages = (uint32_t)((len + 0xfff) >> 12);
++	OSSafeReleaseNULL(a71gpu.slotMem[k]);
++	for (IOByteCount off = 0; off < len;) {
++		IOByteCount seg = 0;
++		addr64_t pa = mem->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || seg == 0 || ((pa | off) & 0xfff)) {
++			a71gpu.slotPages[k] = 8 * 512;  /* clear it all next time */
++			return 0;
++		}
++		for (IOByteCount o = 0; o < seg && off + o < len; o += 0x1000) {
++			l3[(off + o) >> 12] = (pa + o) | A71GPU_PTE | 3;
++		}
++		off += seg;
++	}
++	for (uint32_t i = pages; i < a71gpu.slotPages[k]; i++) {
++		l3[i] = 0;
++	}
++	a71gpu.slotPages[k] = pages;
++	if (!a71gpu_tlbi()) {
++		IOLog("SWEET GPU: tlb sync timeout\n");
++		a71gpu.ready = false;
++		return 0;
++	}
++	mem->retain();
++	a71gpu.slotMem[k] = mem;
++	a71gpu.slotPA[k] = pa0;
++	return A71GPU_SLOT_VA + k * A71GPU_SLOT_SIZE;
++}
++
++/* one 2d engine copy, b8g8r8a8 linear both sides (any 32-bit format copies as is) */
++static void
++a71gpu_blit(uint32_t src, uint32_t spitch, uint32_t sw, uint32_t sh, uint32_t sx,
++    uint32_t dst, uint32_t dpitch, uint32_t dx, uint32_t w, uint32_t h)
++{
++	uint32_t cntl = 0xfu << 20 | 0x30 << 8 | 0x10u << 24;
++	a71gpu_pkt4(0x8401, 4);         /* GRAS_2D_SRC_TL_X .. BR_Y */
++	a71gpu_out(sx << 8);
++	a71gpu_out((sx + w - 1) << 8);
++	a71gpu_out(0);
++	a71gpu_out((h - 1) << 8);
++	a71gpu_reg(0x8405, dx);         /* GRAS_2D_DST_TL, BR */
++	a71gpu_reg(0x8406, (h - 1) << 16 | (dx + w - 1));
++	a71gpu_reg(0x8c00, cntl);       /* RB_2D_BLIT_CNTL */
++	a71gpu_reg(0x8400, cntl);       /* GRAS_2D_BLIT_CNTL */
++	a71gpu_reg(0xacc0, 0xf << 12 | 0x30 << 3);      /* SP_2D_DST_FORMAT */
++	a71gpu_reg(0x8c01, 0);
++	a71gpu_pkt4(0xb4c0, 5);         /* SP_PS_2D_SRC_INFO, SIZE, address, PITCH */
++	a71gpu_out(0x30 | 1 << 10 | 1 << 20 | 1 << 22);
++	a71gpu_out(sh << 15 | sw);
++	a71gpu_out(src);
++	a71gpu_out(0);
++	a71gpu_out(spitch >> 6 << 9);
++	a71gpu_pkt4(0x8c17, 4);         /* RB_2D_DST_INFO, address, PITCH */
++	a71gpu_out(0x30 | 1 << 10);
++	a71gpu_out(dst);
++	a71gpu_out(0);
++	a71gpu_out(dpitch >> 6);
++	a71gpu_pkt7(0x26, 0);           /* CP_WAIT_FOR_IDLE */
++	a71gpu_reg(0x8e04, 0x04100000); /* RB_DBG_ECO_CNTL, a618 blit value */
++	a71gpu_pkt7(0x2c, 1);           /* CP_BLIT BLIT_OP_SCALE */
++	a71gpu_out(3);
++	a71gpu_pkt7(0x26, 0);
++	a71gpu_reg(0x8e04, 0);
++}
++
++/* panel rows dy.. from surface rows sy.., false means use the cpu copy */
++static bool
++a71gpu_present(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
++    int32_t w, int32_t h, uint64_t fb, uint32_t fbPitch)
++{
++	uint32_t bpr = s->bytesPerRow;
++	if (!a71gpu.ready || (bpr & 31) || (fbPitch & 31) || (s->offset & 15) || (fb & 63) ||
++	    fb >= 0x100000000ULL || sx + w > 0x4000 || dx + w + 16 > 0x4000) {
++		return false;
++	}
++	uint32_t va = a71gpu_map(s->memory);
++	if (va == 0) {
++		return false;
++	}
++	uint64_t t0 = mach_absolute_time();
++	CleanPoC_DcacheRegion(src + s->offset + (uint64_t)sy * bpr, (size_t)(h - 1) * bpr + (size_t)(sx + w) * 4);
++
++	/* ccu and uche invalidate (the surface changed), ccu sysmem layout, bypass mode */
++	a71gpu_event(25, false);
++	a71gpu_event(24, false);
++	a71gpu_event(49, false);
++	a71gpu_pkt7(0x26, 0);
++	a71gpu_reg(0x8e07, 0x10000 >> 12 << 23);
++	a71gpu_pkt7(0x65, 1);
++	a71gpu_out(1);
++	for (int32_t j = 0; j < 2 && j < h; j++) {
++		uint64_t d = fb + (uint64_t)(dy + j) * fbPitch;
++		uint32_t skew = (uint32_t)(d & 63);
++		uint32_t n = (uint32_t)(h - j + 1) / 2;
++		a71gpu_blit(va + s->offset + (uint32_t)(sy + j) * bpr, 2 * bpr, (uint32_t)(sx + w), n, (uint32_t)sx,
++		    (uint32_t)(d - skew), 2 * fbPitch, (uint32_t)dx + skew / 4, (uint32_t)w, n);
++	}
++	a71gpu_event(29, true);         /* PC_CCU_FLUSH_COLOR_TS */
++	a71gpu_event(4, true);          /* CACHE_FLUSH_TS */
++	a71gpu_pkt7(0x26, 0);
++	uint32_t fence = ++a71gpu.fence;
++	a71gpu_pkt7(61, 3);             /* CP_MEM_WRITE */
++	a71gpu_out(A71GPU_SCR_VA + 0x80);
++	a71gpu_out(0);
++	a71gpu_out(fence);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a71gpu.regs[0x807] = a71gpu.wptr & (A71GPU_RING_DW - 1);
++
++	volatile uint32_t *done = (volatile uint32_t *)(a71gpu.ram + A71GPU_SCR + 0x80);
++	for (int i = 0; *done != fence; i++) {
++		if (i == 50) {
++			IOLog("SWEET GPU: copy timeout, cpu copies from now on, rptr %u wptr %u rbbm 0x%x fault 0x%x\n",
++			    a71gpu.regs[0x806], a71gpu.wptr & (A71GPU_RING_DW - 1), a71gpu.regs[0x210], a71gpu.regs[0x821]);
++			a71gpu.ready = false;
++			return false;
++		}
++		IOSleep(1);
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	a71gpu.lastUS = ns / 1000;
++	if (a71gpu.presents++ % 1000 == 0) {
++		IOLog("SWEET GPU: present %llu took %llu us (clean, copy, wait)\n", a71gpu.presents, a71gpu.lastUS);
++	}
++	return true;
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -390,6 +676,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (src != 0 && bpe == 4 && a71gpu_present(s, src, sx, sy, dx, dy, w, h, fPhys, fRowBytes)) {
++			src = 0;
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
