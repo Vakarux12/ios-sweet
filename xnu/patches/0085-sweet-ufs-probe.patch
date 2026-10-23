@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 11eafaf..b8b3c5c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -586,6 +586,7 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ /* also called by IOFindBSDRoot for a non ufs root, so only once */
+ void sweet_input_start(void);
+ static void sweet_prz_start(void);
++static void sweet_ufs_probe(void);
+ 
+ void
+ sweet_input_start(void)
+@@ -601,6 +602,12 @@ sweet_input_start(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	/* a71: ufsprobe=1 runs the ufs driver without a ufs root */
++	uint32_t probe = 0;
++	PE_parse_boot_argn("ufsprobe", &probe, sizeof(probe));
++	if (probe && !su.ready) {
++		sweet_ufs_probe();
++	}
+ }
+ 
+ static int
+@@ -680,6 +687,46 @@ sweet_ufs_init(void)
+ 	return 0;
+ }
+ 
++/*
++ * a71: init, then read the first 16 MiB of the partition and print fnv-1a
++ * hashes to compare with a dd of the same bytes from recovery
++ */
++static void
++sweet_ufs_probe(void)
++{
++	const uint32_t per = BOUNCE_SIZE / UFS_BLOCK;
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint32_t h = 2166136261u, h1 = 0;
++	uint8_t magic[4] = { 0 };
++	uint64_t busy = 0, ns;
++	unsigned mib = 0;
++	int error = sweet_ufs_init();
++	if (error) {
++		printf("SWEET UFS: probe init failed (%d)\n", error);
++		return;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	for (; mib < 16 && (mib + 1) * (uint64_t)per <= su.nblocks; mib++) {
++		uint64_t t0 = mach_absolute_time();
++		error = ufs_read_blocks(su.first_block + mib * per, per);
++		busy += mach_absolute_time() - t0;
++		if (error) {
++			break;
++		}
++		for (uint32_t i = 0; i < BOUNCE_SIZE; i++) {
++			h = (h ^ b[i]) * 16777619u;
++		}
++		if (mib == 0) {
++			h1 = h;
++			memcpy(magic, b + 0x400, 4);
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	absolutetime_to_nanoseconds(busy, &ns);
++	printf("SWEET UFS: probe read %u MiB in %llu ms (err %d), fnv first MiB %08x, all %08x, at 0x400 %02x %02x %02x %02x\n",
++	    mib, ns / NSEC_PER_MSEC, error, h1, h, magic[0], magic[1], magic[2], magic[3]);
++}
++
+ /*
+  * Persistent console log ("sweetlog"). Filming the phone screen is the only
+  * other way to see the console, so every character that reaches the
