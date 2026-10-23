@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 276a284..0abcef7 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -12,6 +12,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <IOKit/IOPlatformExpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -106,6 +107,16 @@ keys_reset(const char *why)
+ 	printf("SWEET KEYS: psci system reset returned %#llx\n", x0);
+ }
+ 
++/* a71: restarts and panics (debug bit 0x100000) reset the same way */
++static int
++keys_halt_restart(unsigned int type)
++{
++	if (type == kPERestartCPU || type == kPEPanicRestartCPU) {
++		keys_reset(type == kPERestartCPU ? "restart" : "panic");
++	}
++	return -1;
++}
++
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+@@ -168,6 +179,7 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_started = true;
++	PE_halt_restart = keys_halt_restart;
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
