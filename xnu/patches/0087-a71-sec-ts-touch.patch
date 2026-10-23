@@ -1,0 +1,306 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..0f983c1 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -4,6 +4,7 @@
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * a71: sweet_spmi_write is the one write path, pm6150 gpio4 (touch dvdd) only.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -17,9 +18,11 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++#define SP_CHNL_PA 0x0c600000u /* v5 write channels, 0x10000 per apid */
++#define SP_A71_DVDD 0xc3u     /* pm6150 gpio4 */
+ #define SP_NO_APID 0xffffu
+ 
+-static vm_offset_t sp_core, sp_obs, sp_cfg;
++static vm_offset_t sp_core, sp_obs, sp_cfg, sp_chnl;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+@@ -90,7 +93,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != SP_A71_DVDD)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -123,4 +126,43 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/* ext_writel one byte on the apps-owned channel, like linux spmi-pmic-arb v5 */
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
++{
++	if (!sp_ready || sid != 0 || (addr >> 8) != SP_A71_DVDD) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid(SP_A71_DVDD);
++	if (apid == SP_NO_APID || sp_poisoned[apid] ||
++	    (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	if (!sp_chnl) {
++		sp_chnl = ml_io_map(SP_CHNL_PA + 0x10000u * apid, 0x1000);
++	}
++	if (!sp_chnl) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sp_chnl + 0x10u) = val; /* wdata0 */
++	*(volatile uint32_t *)sp_chnl = (addr & 0xffu) << 4; /* opcode 0, bc 0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(sp_chnl, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET TOUCH: SPMI write timeout addr=%#x APID=%u disabled\n", addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..77f1318 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* a71 touch dvdd only (pm6150 gpio4), same return convention */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..7f9d9ee 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -4,6 +4,8 @@
+  * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+  * zero to GT9896's event status after reading a report. See touch2/report.md.
++ * a71 (boot-arg a71touch=1): samsung sec_ts y771 at 0x48 instead, no rpmh vote,
++ * avdd ldo on tlmm gpio56, dvdd on pm6150 gpio4 (one spmi write path).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -14,6 +16,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -32,6 +35,10 @@ void sweet_touch_init(void);
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
++#define TOUCH_SECTS      3
++#define A71_TS_ADDR      0x48u
++#define A71_AVDD_PA      0x03538000u /* tlmm west tile, gpio56 */
++#define A71_DVDD         0xc300u /* pm6150 gpio4 */
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+ #define GOODIX_EVENT_REG 0x4180u
+@@ -72,9 +79,10 @@ void sweet_touch_init(void);
+ #define SE_PACK1        0x000ffefeu
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
++	vm_offset_t se, gcc, gpio, avdd;
+ 	bool started, dead, probing;
+-	int kind, irq_hint;
++	int kind, irq_hint, a71;
++	unsigned res_x, res_y, raw_shown;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+@@ -487,6 +495,130 @@ touch_focaltech(void)
+ 	return 0;
+ }
+ 
++/* sec_ts / s6sy761 events: 8 bytes, eid 0 = coordinate, 1-based id, 0..res axes */
++static int
++touch_sects(void)
++{
++	uint8_t buf[88];
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	uint32_t mask = st.active;
++	int err = touch_read(A71_TS_ADDR, 0x60, false, buf, 8); /* read one event */
++	if (err) {
++		return err;
++	}
++	unsigned left = buf[7] & 0x3fu;
++	if (!buf[0]) {
++		return 0;
++	}
++	if (left > 10) {
++		const uint8_t clear = 0x62; /* clear event stack, like the vendor driver */
++		(void)touch_msg(A71_TS_ADDR, &clear, 1, NULL, 0, false);
++		return EIO;
++	}
++	if (left) {
++		err = touch_read(A71_TS_ADDR, 0x61, false, buf + 8, left * 8u);
++		if (err) {
++			return err;
++		}
++	}
++	memcpy(x, st.x, sizeof(x));
++	memcpy(y, st.y, sizeof(y));
++	for (unsigned i = 0; i <= left; ++i) {
++		const uint8_t *ev = buf + 8u * i;
++		if (st.raw_shown < 16) {
++			st.raw_shown++;
++			printf("SWEET TOUCH: ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++		}
++		unsigned id = ((ev[0] & 0x3cu) >> 2) - 1u, state = ev[0] >> 6;
++		if ((ev[0] & 3u) || id >= TOUCH_MAX) {
++			continue; /* status or gesture event */
++		}
++		unsigned px = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
++		unsigned py = ((unsigned)ev[2] << 4) | (ev[3] & 15u);
++		px = px * 1080u / st.res_x;
++		py = py * 2400u / st.res_y;
++		if (state == 1 || state == 2) {
++			mask |= 1u << id;
++			x[id] = (int)(px > 1079 ? 1079 : px);
++			y[id] = (int)(py > 2399 ? 2399 : py);
++		} else if (state == 3) {
++			mask &= ~(1u << id);
++		}
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static void
++touch_a71_dvdd(const char *when)
++{
++	uint8_t sub = 0, mode = 0, src = 0, en = 0;
++	int e = sweet_spmi_read(0, A71_DVDD + 0x05u, &sub) |
++	    sweet_spmi_read(0, A71_DVDD + 0x40u, &mode) |
++	    sweet_spmi_read(0, A71_DVDD + 0x44u, &src) |
++	    sweet_spmi_read(0, A71_DVDD + 0x46u, &en);
++	printf("SWEET TOUCH: a71 %s: avdd gpio56 cfg=%#x io=%#x, dvdd gpio4 err=%d sub=%#x mode=%#x src=%#x en=%#x\n",
++	    when, touch_rd(st.avdd, 0), touch_rd(st.avdd, 4), e, sub, mode, src, en);
++}
++
++/* power only if the ic is silent, then the s8 start sequence */
++static bool
++touch_a71_start(void)
++{
++	uint8_t boot = 0, id[3] = {0}, info[4] = {0}, fw = 0;
++	st.avdd = ml_io_map(A71_AVDD_PA, 0x1000);
++	if (!st.avdd || sweet_spmi_init()) {
++		printf("SWEET TOUCH: a71 no gpio56 map or spmi\n");
++		return false;
++	}
++	touch_gpio(9, 0, 0, 0, false, false); /* attn input, no pull, as in the dt */
++	touch_a71_dvdd("before");
++	st.probing = true;
++	int err = touch_read(A71_TS_ADDR, 0x55, false, &boot, 1); /* boot status */
++	st.probing = false;
++	if (err || boot != 0x20) {
++		printf("SWEET TOUCH: a71 sec_ts silent (err=%d boot=%#x), powering avdd then dvdd\n",
++		    err, boot);
++		/* gpio56 out high, latch before output enable, no pull, 2 mA */
++		touch_wr(st.avdd, 4, touch_rd(st.avdd, 4) | 2u);
++		touch_wr(st.avdd, 0, (touch_rd(st.avdd, 0) & ~0x3ffu) | 0x200u);
++		touch_wait(5);
++		/* linux pinctrl-spmi-gpio lv/mv order: mode out, source high, enable */
++		if (sweet_spmi_write(0, A71_DVDD + 0x40u, 0x01) ||
++		    sweet_spmi_write(0, A71_DVDD + 0x44u, 0x80) ||
++		    sweet_spmi_write(0, A71_DVDD + 0x46u, 0x80)) {
++			printf("SWEET TOUCH: a71 dvdd write failed\n");
++		}
++		touch_a71_dvdd("after");
++		touch_wait(300);
++		st.probing = true;
++		err = touch_read(A71_TS_ADDR, 0x55, false, &boot, 1);
++		st.probing = false;
++	}
++	if (err || boot != 0x20) {
++		printf("SWEET TOUCH: a71 sec_ts not in app mode (err=%d boot=%#x); stopping\n",
++		    err, boot);
++		return false;
++	}
++	(void)touch_read(A71_TS_ADDR, 0x52, false, id, sizeof(id));
++	(void)touch_read(A71_TS_ADDR, 0x21, false, &fw, 1);
++	(void)touch_read(A71_TS_ADDR, 0x23, false, info, sizeof(info));
++	st.res_x = touch_be16(info);
++	st.res_y = touch_be16(info + 2);
++	if (st.res_x < 256 || st.res_x > 8192 || st.res_y < 256 || st.res_y > 8192) {
++		st.res_x = st.res_y = 4096; /* dt sec,max_coords */
++	}
++	const uint8_t func[3] = {0x30, 0x01, 0x00}, sense = 0x10;
++	err = touch_msg(A71_TS_ADDR, func, sizeof(func), NULL, 0, false);
++	if (!err) {
++		err = touch_msg(A71_TS_ADDR, &sense, 1, NULL, 0, false);
++	}
++	printf("SWEET TOUCH: a71 sec_ts id %02x%02x%02x fw-integrity %#x panel %ux%u, sense on err=%d\n",
++	    id[0], id[1], id[2], fw, st.res_x, st.res_y, err);
++	return !err;
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -569,6 +701,14 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	if (st.a71) {
++		if (!touch_a71_start()) {
++			goto out;
++		}
++		st.kind = TOUCH_SECTS;
++		st.irq_hint = 1; /* attn is level low while events wait */
++		goto poll;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -610,12 +750,14 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+ 	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+ 	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
++poll:;
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
++			int err = st.kind == TOUCH_SECTS ? touch_sects() :
++			    st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+@@ -646,6 +788,7 @@ sweet_touch_init(void)
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("a71touch", &st.a71, sizeof(st.a71));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
