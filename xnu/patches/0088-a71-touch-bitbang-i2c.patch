@@ -1,0 +1,185 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 7f9d9ee..4236015 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -5,7 +5,8 @@
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+  * zero to GT9896's event status after reading a report. See touch2/report.md.
+  * a71 (boot-arg a71touch=1): samsung sec_ts y771 at 0x48 instead, no rpmh vote,
+- * avdd ldo on tlmm gpio56, dvdd on pm6150 gpio4 (one spmi write path).
++ * avdd ldo on tlmm gpio56, dvdd on pm6150 gpio4 (one spmi write path),
++ * i2c bit-banged on gpio6/7 because its se7 has no fifo mode.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -141,6 +142,116 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out,
+ 	touch_wr(st.gpio, off, cfg);
+ }
+ 
++/*
++ * a71 se7 runs gsi-only firmware (no fifo), so i2c goes by hand on
++ * gpio6 sda and gpio7 scl. open drain: latch stays 0, oe pulls the line low
++ */
++#define BB_SDA 6u
++#define BB_SCL 7u
++
++static void
++bb_set(unsigned pin, bool low)
++{
++	uint32_t off = TOUCH_GPIO_CFG(pin);
++	touch_wr(st.gpio, off, (touch_rd(st.gpio, off) & ~0x3ffu) | 3u | (low ? 0x200u : 0u));
++	delay(5);
++}
++
++static bool
++bb_get(unsigned pin)
++{
++	return touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & 1u;
++}
++
++/* release scl and wait out clock stretching */
++static bool
++bb_scl_up(void)
++{
++	bb_set(BB_SCL, false);
++	for (unsigned i = 0; i < 2000; ++i) {
++		if (bb_get(BB_SCL)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++bb_bit(bool one, bool *in)
++{
++	bb_set(BB_SDA, !one);
++	if (!bb_scl_up()) {
++		return false;
++	}
++	if (in) {
++		*in = bb_get(BB_SDA);
++	}
++	bb_set(BB_SCL, true);
++	return true;
++}
++
++static int
++bb_out(uint8_t b)
++{
++	bool nack = true;
++	for (int i = 7; i >= 0; --i) {
++		if (!bb_bit((b >> i) & 1u, NULL)) {
++			return ETIMEDOUT;
++		}
++	}
++	if (!bb_bit(true, &nack)) {
++		return ETIMEDOUT;
++	}
++	return nack ? ENXIO : 0;
++}
++
++static int
++bb_in(uint8_t *b, bool more)
++{
++	bool v = false;
++	*b = 0;
++	for (int i = 0; i < 8; ++i) {
++		if (!bb_bit(true, &v)) {
++			return ETIMEDOUT;
++		}
++		*b = (uint8_t)(*b << 1 | v);
++	}
++	return bb_bit(!more, NULL) ? 0 : ETIMEDOUT; /* ack all but the last byte */
++}
++
++static void
++bb_stop(void)
++{
++	bb_set(BB_SDA, true);
++	(void)bb_scl_up();
++	bb_set(BB_SDA, false);
++}
++
++/* stretch keeps the bus for a repeated start, like the se7 path */
++static int
++touch_bb_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	bb_set(BB_SDA, false);
++	if (!bb_scl_up()) {
++		return ETIMEDOUT;
++	}
++	bb_set(BB_SDA, true);
++	bb_set(BB_SCL, true);
++	int err = bb_out((uint8_t)(addr << 1 | (nr ? 1u : 0u)));
++	for (unsigned i = 0; i < nt && !err; ++i) {
++		err = bb_out(tx[i]);
++	}
++	for (unsigned i = 0; i < nr && !err; ++i) {
++		err = bb_in(&rx[i], i + 1 < nr);
++	}
++	if (err || !stretch) {
++		bb_stop();
++	}
++	return err;
++}
++
+ static bool
+ touch_clocks(void)
+ {
+@@ -302,12 +413,13 @@ touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ {
+ 	st.irq_status = st.irq_last = 0;
+ 	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
++	int err = st.a71 ? touch_bb_msg(addr, tx, nt, rx, nr, stretch) :
++	    touch_msg_run(addr, tx, nt, rx, nr, stretch);
+ 	if (st.probing) {
+ 		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+ 		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+ 		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    touch_rd(st.se, SE_STATUS));
++		    st.a71 ? 0u : touch_rd(st.se, SE_STATUS)); /* se7 is unclocked on a71 */
+ 	}
+ 	return err;
+ }
+@@ -573,6 +685,17 @@ touch_a71_start(void)
+ 		return false;
+ 	}
+ 	touch_gpio(9, 0, 0, 0, false, false); /* attn input, no pull, as in the dt */
++	/* sda and scl to plain gpio, latch 0, released, then clock out a stuck slave */
++	for (unsigned pin = BB_SDA; pin <= BB_SCL; ++pin) {
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
++		bb_set(pin, false);
++	}
++	for (unsigned i = 0; i < 9 && !bb_get(BB_SDA); ++i) {
++		bb_set(BB_SCL, true);
++		(void)bb_scl_up();
++	}
++	bb_stop();
++	printf("SWEET TOUCH: a71 bit-banged i2c, idle sda=%d scl=%d\n", bb_get(BB_SDA), bb_get(BB_SCL));
+ 	touch_a71_dvdd("before");
+ 	st.probing = true;
+ 	int err = touch_read(A71_TS_ADDR, 0x55, false, &boot, 1); /* boot status */
+@@ -698,9 +821,6 @@ touch_thread(void *arg, wait_result_t result)
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
+-		goto out;
+-	}
+ 	if (st.a71) {
+ 		if (!touch_a71_start()) {
+ 			goto out;
+@@ -709,6 +829,9 @@ touch_thread(void *arg, wait_result_t result)
+ 		st.irq_hint = 1; /* attn is level low while events wait */
+ 		goto poll;
+ 	}
++	if (!touch_clocks() || !touch_se_init()) {
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
