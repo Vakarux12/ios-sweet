@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7efbde1..11eafaf 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -585,6 +585,7 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 
+ /* also called by IOFindBSDRoot for a non ufs root, so only once */
+ void sweet_input_start(void);
++static void sweet_prz_start(void);
+ 
+ void
+ sweet_input_start(void)
+@@ -595,6 +596,7 @@ sweet_input_start(void)
+ 		return;
+ 	}
+ 	started = true;
++	sweet_prz_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+@@ -696,6 +698,29 @@ sweet_ufs_init(void)
+ #define SWEET_LOG_SECS          10u
+ 
+ static char sweet_log_ring[SWEET_LOG_SIZE];
++
++#define SWEET_PRZ_DATA          (0x40000u - 12)
++
++/* linux struct persistent_ram_buffer, no ecc */
++struct sweet_prz {
++	uint32_t sig, start, size;
++	uint8_t data[SWEET_PRZ_DATA];
++};
++static volatile struct sweet_prz *sweet_prz;
++
++static void
++sweet_prz_put(uint64_t at, const char *c, int size)
++{
++	volatile struct sweet_prz *z = sweet_prz;
++	uint64_t end = at + (uint64_t)size;
++
++	for (int i = 0; i < size; i++) {
++		z->data[(at + (uint64_t)i) % SWEET_PRZ_DATA] = (uint8_t)c[i];
++	}
++	z->start = (uint32_t)(end % SWEET_PRZ_DATA);
++	z->size = (uint32_t)MIN(end, (uint64_t)SWEET_PRZ_DATA);
++}
++
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -713,6 +738,36 @@ sweet_log_append(const char *c, int size)
+ 	for (int i = 0; i < size; i++) {
+ 		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+ 	}
++	if (sweet_prz) {
++		sweet_prz_put(at, c, size);
++	}
++}
++
++/*
++ * boot-arg sweetprz=<phys> also keeps the console in a linux ramoops console
++ * zone of 256 KiB there, so after a warm reset recovery shows it as
++ * /sys/fs/pstore/console-ramoops-0 (a71: sweetprz=0xa1340000)
++ */
++static void
++sweet_prz_start(void)
++{
++	uint64_t pa = 0;
++
++	if (!PE_parse_boot_argn("sweetprz", &pa, sizeof(pa)) || !pa) {
++		return;
++	}
++	volatile struct sweet_prz *z = (volatile struct sweet_prz *)ml_io_map(pa, sizeof(*z));
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t from = total > SWEET_PRZ_DATA ? total - SWEET_PRZ_DATA : 0;
++
++	z->sig = 0x43474244u;	/* "DBGC" */
++	for (uint64_t n = from; n < total; n++) {
++		z->data[n % SWEET_PRZ_DATA] = (uint8_t)sweet_log_ring[n % SWEET_LOG_SIZE];
++	}
++	z->start = (uint32_t)(total % SWEET_PRZ_DATA);
++	z->size = (uint32_t)(total - from);
++	sweet_prz = z;
++	printf("SWEET LOG: console also in ramoops at 0x%llx\n", pa);
+ }
+ 
+ /*
