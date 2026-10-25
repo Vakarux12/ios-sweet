@@ -1,0 +1,14 @@
+diff --git a/iokit/Kernel/arm/A71Adreno.cpp b/iokit/Kernel/arm/A71Adreno.cpp
+index 6df3886..d71d849 100644
+--- a/iokit/Kernel/arm/A71Adreno.cpp
++++ b/iokit/Kernel/arm/A71Adreno.cpp
+@@ -229,7 +229,8 @@ a71gpu_init(void)
+ 		return false;
+ 	}
+ 	a71gpu.ram = ml_io_map(A71GPU_RAM_PA, A71GPU_RAM_SIZE);
+-	a71gpu.regs = (volatile uint32_t *)ml_io_map(0x05000000, 0x10000);
++	/* the whole kgsl_3d0_reg_memory, a71gpu_hw_init writes up to 0xb604 */
++	a71gpu.regs = (volatile uint32_t *)ml_io_map(0x05000000, 0x40000);
+ 	a71gpu.cb0 = (volatile uint32_t *)ml_io_map(0x05048000, 0x1000);
+ 	a71gpu.lock = IOLockAlloc();
+ 	if (a71gpu.ram == 0 || a71gpu.regs == NULL || a71gpu.cb0 == NULL || a71gpu.lock == NULL) {
