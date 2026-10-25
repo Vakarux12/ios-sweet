@@ -28,6 +28,6 @@ else
 	cp "$here"/patches/*.patch "$here"/patches/*.sh dxb/patches/
 fi
 (cd dxb && bash build.sh)
-mkdir -p out
+rm -rf out && mkdir out
 cp -R dxb/fakeroot/System/Library/Kernels/. out/
 cd out && shasum -a 256 kernel.development.sweet > SHA256SUMS && cat SHA256SUMS
