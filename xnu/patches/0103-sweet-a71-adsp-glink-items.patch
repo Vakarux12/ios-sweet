@@ -1,0 +1,91 @@
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index dbca25a..e726381 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -261,6 +261,9 @@ struct smem_item {
+ #define ITEM_SMP2P_OURS         429
+ #define ITEM_SMP2P_THEIRS       443
+ #define ITEM_CRASH_REASON       423
++#define ITEM_GLINK_DESCRIPTOR   478
++#define ITEM_GLINK_OUR_QUEUE    479
++#define ITEM_GLINK_THEIR_QUEUE  480
+ 
+ static const volatile uint8_t *smem;
+ 
+@@ -1433,18 +1436,18 @@ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
+ 
+ /* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one (redwood_wifi.c: our_item_make()). */
+ static bool
+-our_item_make(uint32_t partition)
++our_item_make(uint32_t partition, uint32_t item, uint32_t bytes)
+ {
+ 	struct smem_partition header;
+ 	struct smem_entry entry;
+-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
++	const uint32_t item_size = (bytes + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
+ 	uint32_t owner = ~0u, at;
+ 	bool made = false;
+ 
+ 	lck_mtx_lock(&smem_alloc_lock);         /* (the Wi-Fi's start allocates under the same hardware lock) */
+ 	need(&smem_lock);
+ 	printf("adsp: %u: about to take the lock (%#x), write an entry for item %u with %u bytes behind it at the partition's mark, "
+-	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, ITEM_SMP2P_OURS, item_size, need_bytes);
++	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, item, item_size, need_bytes);
+ 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
+ 	for (uint32_t ms = 0; ms <= 1000; ms++) {
+ 		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
+@@ -1465,7 +1468,7 @@ our_item_make(uint32_t partition)
+ 		goto out;
+ 	}
+ 	for (at = sizeof(header); at < header.free_uncached;) {
+-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
++		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
+ 		    entry.size > header.size) {
+ 			break;
+ 		}
+@@ -1480,9 +1483,9 @@ our_item_make(uint32_t partition)
+ 		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
+ 		goto out;
+ 	}
+-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
++	smem_poke(partition + at, SMEM_CANARY | item << 16);
+ 	smem_poke(partition + at + 4, item_size);
+-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));
++	smem_poke(partition + at + 8, item_size - bytes);
+ 	smem_poke(partition + at + 12, 0);
+ 	settle();
+ 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
+@@ -1515,7 +1518,7 @@ step_our_item(void)
+ 		printf("adsp: %u: item %u is there, at %#lx: a kernel before this one made it, and it is used again\n", step,
+ 		    ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
+ 	} else {
+-		if (!our_item_make(partition)) {
++		if (!our_item_make(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p))) {
+ 			return false;
+ 		}
+ 		our_item = our_item_find();
+@@ -1550,6 +1553,14 @@ step_our_item(void)
+ 		return false;
+ 	}
+ 	show_words("our item reads back", &ours);
++	/* a71: glink's descriptor and our queue, which linux's qcom_glink_smem_register() makes and no boot loader has */
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t item = i ? ITEM_GLINK_OUR_QUEUE : ITEM_GLINK_DESCRIPTOR;
++
++		if (smem_item(item, &size) == 0 && !our_item_make(partition, item, i ? 0x4000 : 32)) {
++			return false;
++		}
++	}
+ 	glink_reset();
+ 	return true;
+ }
+@@ -1698,9 +1709,6 @@ step_start(void)
+ 
+ /* ---- GLINK (redwood_wifi.c; items 478 to 480 of our partition with the audio DSP) ------------------- */
+ 
+-#define ITEM_GLINK_DESCRIPTOR   478
+-#define ITEM_GLINK_OUR_QUEUE    479
+-#define ITEM_GLINK_THEIR_QUEUE  480
+ #define GLINK_OUR_TAIL          0
+ #define GLINK_OUR_HEAD          4
+ #define GLINK_THEIR_TAIL        8
