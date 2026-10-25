@@ -71,5 +71,5 @@ mkdir -p "$O/RedwoodAudio.driver"
 "${DYN[@]}" -bundle -framework CoreFoundation -o "$O/RedwoodAudio.driver/RedwoodAudio" "$ROOT/audio/audio_plugin.c"
 cp "$ROOT/audio/audio_plugin.plist" "$O/RedwoodAudio.driver/Info.plist"
 # install_name_tool broke the linker signature
-codesign -f -s - "$O"/*.dylib "$O/RedwoodAudio.driver/RedwoodAudio"
+codesign -f -s - "$O"/*.dylib
 cd "$O" && shasum -a 256 *.dylib RedwoodAudio.driver/* > SHA256SUMS && ls -l . RedwoodAudio.driver
