@@ -1,0 +1,113 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index a4e5569..c9be19e 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -48,6 +48,7 @@
+ 
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
++extern SInt32 sweet_surface_gpu_held;     /* SweetSurface.cpp, for its out of memory report */
+ 
+ extern "C" {
+ /* bsd/dev/redwood_adreno.c ("the GPU kept on"; declared in bsd/sys/redwood_input.h, which is not seen from here) */
+@@ -524,6 +525,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		}
+ 		if (b->surface != NULL) {
+ 			b->surface->release();
++			OSDecrementAtomic(&sweet_surface_gpu_held);
+ 		}
+ 	}
+ 	b->memory = NULL;
+@@ -557,6 +559,7 @@ RedwoodGPUUserClient::reap(void)
+ 		}
+ 		if (left->surface != NULL) {
+ 			left->surface->release();
++			OSDecrementAtomic(&sweet_surface_gpu_held);
+ 		}
+ 		*left = fLeft[--fLeftCount];
+ 	}
+@@ -966,6 +969,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		b->kernel = (uint8_t *) s->kernelAddress();
+ 		b->surface = s;
+ 		gGPUStat.surfaces++;
++		OSIncrementAtomic(&sweet_surface_gpu_held);
+ 	}
+ 	gGPUStat.taking += mach_absolute_time() - began;
+ 	IOLockUnlock(gGPULock);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1416738..da52b87 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -113,6 +113,8 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++static SInt32        sweet_surface_live;        /* not freed yet, in the table or not */
++SInt32               sweet_surface_gpu_held;    /* surfaces a RedwoodGPU buffer holds */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+@@ -286,6 +288,7 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ void
+ SweetSurface::free()
+ {
++	OSDecrementAtomic(&sweet_surface_live);
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -386,6 +389,37 @@ sweet_surface_put(SweetSurface *s)
+ 	}
+ }
+ 
++/* a create found no memory: who holds the big surfaces (the first 3 times, then every 500th) */
++static void
++sweet_surface_report_full(void)
++{
++	static uint32_t times;
++	uint32_t big = 0, users = 0, retains = 0;
++	char list[160];
++	size_t at = 0;
++
++	if (times++ >= 3 && times % 500 != 0) {
++		return;
++	}
++	list[0] = 0;
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *s = sweet_surface_table[id];
++		if (s == NULL || s->allocSize < (8u << 20)) {
++			continue;
++		}
++		users += sweet_surface_users[id];
++		retains += s->getRetainCount();
++		if (big++ < 12 && at < sizeof(list)) {
++			at += snprintf(list + at, sizeof(list) - at, " %u:%u/%d", id, sweet_surface_users[id], s->getRetainCount());
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	IOLog("SWEET SURF: no memory %u: %d live, %llu MB wired, gpu holds %d\n", times, sweet_surface_live,
++	    sweet_surface_wired >> 20, sweet_surface_gpu_held);
++	IOLog("SWEET SURF: %u big in the table, users %u retains %u, id:users/retains%s\n", big, users, retains, list);
++}
++
+ SweetSurface *
+ sweet_surface_copy(uint32_t id)
+ {
+@@ -423,6 +457,7 @@ sweet_surface_alloc(void)
+ 		OSSafeReleaseNULL(s);
+ 		return NULL;
+ 	}
++	OSIncrementAtomic(&sweet_surface_live);
+ 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryKernelUserShared, SWEET_UPAGE, SWEET_UPAGE);
+ 	if (s->state == NULL) {
+@@ -1125,6 +1160,9 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	if (ret == kIOReturnNoMemory) {
++		sweet_surface_report_full();
++	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
