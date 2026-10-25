@@ -1,0 +1,653 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..5650367 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_haptic.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_haptic.c b/bsd/dev/sweet_haptic.c
+new file mode 100644
+index 0000000..00472c4
+--- /dev/null
++++ b/bsd/dev/sweet_haptic.c
+@@ -0,0 +1,145 @@
++/*
++ * a71 vibration: a coin motor on the pm6150 vibrator ldo (spmi sid 1 at 0x5300), at the
++ * 3.3 V android sets. iOS plays its haptics as samples of one channel on its "Actuator",
++ * which topaz's audio plug-in (userland audio_plugin.c) writes to /dev/redwood-haptic.
++ * the motor runs while they are not silence, at least MIN_ON_US so a tap spins it up,
++ * at most MAX_ON_US and then it rests as long. boot-arg sweethaptic=1
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++void sweet_haptic_start(void);
++
++#define VIB_STATUS1   0x5308u /* bit 7: ldo ready */
++#define VIB_VSET_LB   0x5340u /* mV, low byte first */
++#define VIB_EN_CTL    0x5346u /* bit 7: on */
++#define SILENT_BELOW  256u    /* of 32768, as topaz */
++#define QUIET_US      30000u  /* this long without sound and iOS has stopped */
++#define MIN_ON_US     40000u
++#define MAX_ON_US     1000000u
++
++static volatile uint64_t heard_us;
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++/* from the audio server's io thread: never waits */
++static int
++haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t samples[256];
++	int error = 0;
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t bytes = uio_resid(uio);
++		if (bytes > (user_ssize_t)sizeof(samples)) {
++			bytes = sizeof(samples);
++		}
++		bytes &= ~(user_ssize_t)1;
++		if ((error = uiomove((caddr_t)samples, (int)bytes, uio)) != 0) {
++			break;
++		}
++		for (unsigned i = 0; i < bytes / 2; i++) {
++			if (samples[i] > (int)SILENT_BELOW || samples[i] < -(int)SILENT_BELOW) {
++				heard_us = now_us();
++				break;
++			}
++		}
++	}
++	return error;
++}
++
++static int
++haptic_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw haptic_cdevsw = {
++	.d_open = haptic_open, .d_close = haptic_open, .d_read = eno_rdwrt, .d_write = haptic_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static bool
++motor(bool on)
++{
++	return sweet_spmi_write(1, VIB_EN_CTL, on ? 0x80 : 0) == 0;
++}
++
++static void
++haptic_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	uint64_t since = 0, rest_until = 0;
++	unsigned played = 0;
++	bool on = false;
++	int major;
++	if (sweet_spmi_init() || !motor(false) || sweet_spmi_write(1, VIB_VSET_LB, 0xe4) ||
++	    sweet_spmi_write(1, VIB_VSET_LB + 1, 0x0c)) {
++		printf("SWEET HAPTIC: the vibrator ldo does not take writes\n");
++		return;
++	}
++	major = cdevsw_add(-1, &haptic_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666,
++	    "redwood-haptic") == NULL) {
++		printf("SWEET HAPTIC: /dev/redwood-haptic cannot be made\n");
++		return;
++	}
++	printf("SWEET HAPTIC: the motor follows /dev/redwood-haptic, 3300 mV\n");
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "sweetvib", 1);
++		uint64_t now = now_us();
++		bool sound = heard_us != 0 && now - heard_us < QUIET_US;
++		if (!on && sound && now >= rest_until) {
++			if (!motor(true)) {
++				break;
++			}
++			on = true;
++			since = now;
++			if (++played <= 10) {
++				uint8_t status = 0;
++				(void)sweet_spmi_read(1, VIB_STATUS1, &status);
++				printf("SWEET HAPTIC: %u on, ldo status %#x\n", played, status);
++			}
++		} else if (on && ((!sound && now - since >= MIN_ON_US) || now - since >= MAX_ON_US)) {
++			bool cut = now - since >= MAX_ON_US;
++			if (cut) {
++				rest_until = now + MAX_ON_US;
++			}
++			if (!motor(false)) {
++				break;
++			}
++			on = false;
++			if (played <= 10) {
++				printf("SWEET HAPTIC: %u off after %llu ms%s\n", played, (now - since) / 1000, cut ? ", cut" : "");
++			}
++		}
++	}
++	(void)motor(false);
++	printf("SWEET HAPTIC: spmi write failed, the motor is given up on\n");
++}
++
++void
++sweet_haptic_start(void)
++{
++	thread_t thread;
++	uint32_t want = 0;
++	if (PE_parse_boot_argn("sweethaptic", &want, sizeof(want)) && want == 1 &&
++	    kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 0f983c1..8fe1ed8 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -20,9 +20,11 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_CFG_PA  0x0c40a000u
+ #define SP_CHNL_PA 0x0c600000u /* v5 write channels, 0x10000 per apid */
+ #define SP_A71_DVDD 0xc3u     /* pm6150 gpio4 */
++#define SP_A71_VIB  0x153u    /* pm6150 (sid 1) vibrator ldo */
+ #define SP_NO_APID 0xffffu
+ 
+-static vm_offset_t sp_core, sp_obs, sp_cfg, sp_chnl;
++static vm_offset_t sp_core, sp_obs, sp_cfg;
++static vm_offset_t sp_chnl[512];
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+@@ -91,9 +93,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != SP_A71_DVDD)) {
++	bool battery = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x48 || peripheral == SP_A71_DVDD);
++	if (!sp_ready || !out || addr > 0xffffu || (!battery && ((sid << 8) | peripheral) != SP_A71_VIB)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -131,29 +133,31 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ {
+-	if (!sp_ready || sid != 0 || (addr >> 8) != SP_A71_DVDD) {
++	unsigned ppid = (sid << 8) | (addr >> 8);
++	if (!sp_ready || addr > 0xffffu || (ppid != SP_A71_DVDD && ppid != SP_A71_VIB)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid(SP_A71_DVDD);
++	uint16_t apid = sp_find_apid(ppid);
+ 	if (apid == SP_NO_APID || sp_poisoned[apid] ||
+ 	    (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+-	if (!sp_chnl) {
+-		sp_chnl = ml_io_map(SP_CHNL_PA + 0x10000u * apid, 0x1000);
++	if (!sp_chnl[apid]) {
++		sp_chnl[apid] = ml_io_map(SP_CHNL_PA + 0x10000u * apid, 0x1000);
+ 	}
+-	if (!sp_chnl) {
++	vm_offset_t chnl = sp_chnl[apid];
++	if (!chnl) {
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_chnl + 0x10u) = val; /* wdata0 */
+-	*(volatile uint32_t *)sp_chnl = (addr & 0xffu) << 4; /* opcode 0, bc 0 */
++	*(volatile uint32_t *)(chnl + 0x10u) = val; /* wdata0 */
++	*(volatile uint32_t *)chnl = (addr & 0xffu) << 4; /* opcode 0, bc 0 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_chnl, 0x08u);
++		uint32_t status = sp_rd(chnl, 0x08u);
+ 		if (status & 1u) {
+ 			IOLockUnlock(sp_lock);
+ 			return (status & 0x0eu) ? -1 : 0;
+@@ -161,7 +165,7 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ 		delay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
+-	printf("SWEET TOUCH: SPMI write timeout addr=%#x APID=%u disabled\n", addr, apid);
++	printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 77f1318..c9ab624 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,7 +8,7 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+-/* a71 touch dvdd only (pm6150 gpio4), same return convention */
++/* a71 touch dvdd (pm6150 gpio4) and vibrator ldo (sid 1 0x53xx) only, same return convention */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 11d1512..8b6e96f 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -146,30 +146,33 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out,
+  * a71 se7 runs gsi-only firmware (no fifo), so i2c goes by hand on
+  * gpio6 sda and gpio7 scl. open drain: latch stays 0, oe pulls the line low
+  */
+-#define BB_SDA 6u
+-#define BB_SCL 7u
++struct bb_bus {
++	vm_offset_t gpio;
++	unsigned sda, scl;
++};
++static struct bb_bus touch_bus = { 0, 6u, 7u };
+ 
+ static void
+-bb_set(unsigned pin, bool low)
++bb_set(const struct bb_bus *b, unsigned pin, bool low)
+ {
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	touch_wr(st.gpio, off, (touch_rd(st.gpio, off) & ~0x3ffu) | 3u | (low ? 0x200u : 0u));
++	touch_wr(b->gpio, off, (touch_rd(b->gpio, off) & ~0x3ffu) | 3u | (low ? 0x200u : 0u));
+ 	delay(5);
+ }
+ 
+ static bool
+-bb_get(unsigned pin)
++bb_get(const struct bb_bus *b, unsigned pin)
+ {
+-	return touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & 1u;
++	return touch_rd(b->gpio, TOUCH_GPIO_IO(pin)) & 1u;
+ }
+ 
+ /* release scl and wait out clock stretching */
+ static bool
+-bb_scl_up(void)
++bb_scl_up(const struct bb_bus *b)
+ {
+-	bb_set(BB_SCL, false);
++	bb_set(b, b->scl, false);
+ 	for (unsigned i = 0; i < 2000; ++i) {
+-		if (bb_get(BB_SCL)) {
++		if (bb_get(b, b->scl)) {
+ 			return true;
+ 		}
+ 		delay(1);
+@@ -178,80 +181,117 @@ bb_scl_up(void)
+ }
+ 
+ static bool
+-bb_bit(bool one, bool *in)
++bb_bit(const struct bb_bus *b, bool one, bool *in)
+ {
+-	bb_set(BB_SDA, !one);
+-	if (!bb_scl_up()) {
++	bb_set(b, b->sda, !one);
++	if (!bb_scl_up(b)) {
+ 		return false;
+ 	}
+ 	if (in) {
+-		*in = bb_get(BB_SDA);
++		*in = bb_get(b, b->sda);
+ 	}
+-	bb_set(BB_SCL, true);
++	bb_set(b, b->scl, true);
+ 	return true;
+ }
+ 
+ static int
+-bb_out(uint8_t b)
++bb_out(const struct bb_bus *b, uint8_t byte)
+ {
+ 	bool nack = true;
+ 	for (int i = 7; i >= 0; --i) {
+-		if (!bb_bit((b >> i) & 1u, NULL)) {
++		if (!bb_bit(b, (byte >> i) & 1u, NULL)) {
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+-	if (!bb_bit(true, &nack)) {
++	if (!bb_bit(b, true, &nack)) {
+ 		return ETIMEDOUT;
+ 	}
+ 	return nack ? ENXIO : 0;
+ }
+ 
+ static int
+-bb_in(uint8_t *b, bool more)
++bb_in(const struct bb_bus *b, uint8_t *byte, bool more)
+ {
+ 	bool v = false;
+-	*b = 0;
++	*byte = 0;
+ 	for (int i = 0; i < 8; ++i) {
+-		if (!bb_bit(true, &v)) {
++		if (!bb_bit(b, true, &v)) {
+ 			return ETIMEDOUT;
+ 		}
+-		*b = (uint8_t)(*b << 1 | v);
++		*byte = (uint8_t)(*byte << 1 | v);
+ 	}
+-	return bb_bit(!more, NULL) ? 0 : ETIMEDOUT; /* ack all but the last byte */
++	return bb_bit(b, !more, NULL) ? 0 : ETIMEDOUT; /* ack all but the last byte */
+ }
+ 
+ static void
+-bb_stop(void)
++bb_stop(const struct bb_bus *b)
+ {
+-	bb_set(BB_SDA, true);
+-	(void)bb_scl_up();
+-	bb_set(BB_SDA, false);
++	bb_set(b, b->sda, true);
++	(void)bb_scl_up(b);
++	bb_set(b, b->sda, false);
++}
++
++/* sda and scl to plain gpio, latch 0, released, then clock out a stuck slave */
++static void
++bb_reset(const struct bb_bus *b)
++{
++	unsigned pins[] = { b->sda, b->scl };
++	for (unsigned i = 0; i < 2; ++i) {
++		touch_wr(b->gpio, TOUCH_GPIO_IO(pins[i]), touch_rd(b->gpio, TOUCH_GPIO_IO(pins[i])) & ~2u);
++		bb_set(b, pins[i], false);
++	}
++	for (unsigned i = 0; i < 9 && !bb_get(b, b->sda); ++i) {
++		bb_set(b, b->scl, true);
++		(void)bb_scl_up(b);
++	}
++	bb_stop(b);
+ }
+ 
+ /* stretch keeps the bus for a repeated start, like the se7 path */
+ static int
+-touch_bb_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++bb_msg(const struct bb_bus *b, uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	bb_set(BB_SDA, false);
+-	if (!bb_scl_up()) {
++	bb_set(b, b->sda, false);
++	if (!bb_scl_up(b)) {
+ 		return ETIMEDOUT;
+ 	}
+-	bb_set(BB_SDA, true);
+-	bb_set(BB_SCL, true);
+-	int err = bb_out((uint8_t)(addr << 1 | (nr ? 1u : 0u)));
++	bb_set(b, b->sda, true);
++	bb_set(b, b->scl, true);
++	int err = bb_out(b, (uint8_t)(addr << 1 | (nr ? 1u : 0u)));
+ 	for (unsigned i = 0; i < nt && !err; ++i) {
+-		err = bb_out(tx[i]);
++		err = bb_out(b, tx[i]);
+ 	}
+ 	for (unsigned i = 0; i < nr && !err; ++i) {
+-		err = bb_in(&rx[i], i + 1 < nr);
++		err = bb_in(b, &rx[i], i + 1 < nr);
+ 	}
+ 	if (err || !stretch) {
+-		bb_stop();
++		bb_stop(b);
+ 	}
+ 	return err;
+ }
+ 
++/*
++ * android's i2c-gpio bus 12c@14: sda gpio101, scl gpio102 on the same north tile,
++ * the s2mu106 fuel gauge at 0x3b. one register byte, for one caller thread (SweetBattery)
++ */
++int sweet_i2c_gpio_read(uint8_t addr, uint8_t reg, uint8_t *val);
++
++int
++sweet_i2c_gpio_read(uint8_t addr, uint8_t reg, uint8_t *val)
++{
++	static struct bb_bus bus = { 0, 101u, 102u };
++	if (!bus.gpio) {
++		bus.gpio = ml_io_map(TOUCH_NORTH_PA, TOUCH_GPIO_CFG(103));
++		if (!bus.gpio) {
++			return ENOMEM;
++		}
++		bb_reset(&bus);
++	}
++	int err = bb_msg(&bus, addr, &reg, 1, NULL, 0, true);
++	return err ? err : bb_msg(&bus, addr, NULL, 0, val, 1, false);
++}
++
+ static bool
+ touch_clocks(void)
+ {
+@@ -413,7 +453,7 @@ touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ {
+ 	st.irq_status = st.irq_last = 0;
+ 	st.sent = st.got = 0;
+-	int err = st.a71 ? touch_bb_msg(addr, tx, nt, rx, nr, stretch) :
++	int err = st.a71 ? bb_msg(&touch_bus, addr, tx, nt, rx, nr, stretch) :
+ 	    touch_msg_run(addr, tx, nt, rx, nr, stretch);
+ 	if (st.probing) {
+ 		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+@@ -686,17 +726,10 @@ touch_a71_start(void)
+ 		return false;
+ 	}
+ 	touch_gpio(9, 0, 0, 0, false, false); /* attn input, no pull, as in the dt */
+-	/* sda and scl to plain gpio, latch 0, released, then clock out a stuck slave */
+-	for (unsigned pin = BB_SDA; pin <= BB_SCL; ++pin) {
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
+-		bb_set(pin, false);
+-	}
+-	for (unsigned i = 0; i < 9 && !bb_get(BB_SDA); ++i) {
+-		bb_set(BB_SCL, true);
+-		(void)bb_scl_up();
+-	}
+-	bb_stop();
+-	printf("SWEET TOUCH: a71 bit-banged i2c, idle sda=%d scl=%d\n", bb_get(BB_SDA), bb_get(BB_SCL));
++	touch_bus.gpio = st.gpio;
++	bb_reset(&touch_bus);
++	printf("SWEET TOUCH: a71 bit-banged i2c, idle sda=%d scl=%d\n", bb_get(&touch_bus, touch_bus.sda),
++	    bb_get(&touch_bus, touch_bus.scl));
+ 	touch_a71_dvdd("before");
+ 	st.probing = true;
+ 	int err = touch_read(A71_TS_ADDR, 0x55, false, &boot, 1); /* boot status */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 58a24de..bac4d78 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,7 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
++extern void sweet_haptic_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+@@ -683,6 +684,7 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	sweet_haptic_start();
+ 	sweet_input_start();
+ 	return 0;
+ }
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..7fe89fb 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -2,6 +2,8 @@
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * sweetbattery=2: the a71's s2mu106 fuel gauge (i2c 0x3b), its own SOC, voltage
++ * and current, read the way samsung's s2mu106_fuelgauge.c reads them.
+  * See report.md for binary evidence, register provenance and integration.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -15,6 +17,8 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_touch.c */
++extern "C" int sweet_i2c_gpio_read(uint8_t addr, uint8_t reg, uint8_t *val);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -26,7 +30,7 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fGauge;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -35,8 +39,9 @@ private:
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
++	static bool readWord(bool gauge, unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
++	void pollGauge(void);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -51,7 +56,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fGauge = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -151,10 +156,10 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		legacy->release();
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+-	int mode = measured ? 1 : 0;
++	int mode = measured ? (int)(percent << 1 | charging) + 1 : 0; /* (logged on each change) */
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    !measured ? "static fallback" : fGauge ? "S2MU106 fuel gauge" : "PM6150 / estimated SOC",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -164,13 +169,14 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+ bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
++SweetBattery::readWord(bool gauge, unsigned address, uint16_t *value)
+ {
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (gauge ? sweet_i2c_gpio_read(0x3b, (uint8_t)address, &lo) ||
++		    sweet_i2c_gpio_read(0x3b, (uint8_t)(address + 1), &hi) :
++		    sweet_spmi_read(0, address, &lo) || sweet_spmi_read(0, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -203,15 +209,44 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/*
++ * s2mu106: rsoc 0x08 (1/2^14 of 100 %), vbat 0x04 (1/8192 V), current 0x06 (1/4096 A,
++ * negative while charging), each two bytes low first. samsung shows rsoc scaled by
++ * its capacity_max, 990 of 1000 in the a71's dt (it learns it slowly, a point or so off).
++ */
++void
++SweetBattery::pollGauge(void)
++{
++	uint16_t soc, vbat, cur;
++	bool valid = readWord(true, 0x08, &soc) && !(soc & 0x8000u) && readWord(true, 0x04, &vbat);
++	bool currentValid = readWord(true, 0x06, &cur);
++	unsigned mv = valid ? ((unsigned)vbat * 1000u) >> 13 : 0;
++	if (!valid || mv < 2800 || mv > 4600) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned permille = ((unsigned)soc * 1000u >> 14) * 1000u / 990u;
++	unsigned percent = permille >= 1000 ? 100 : permille / 10;
++	int ma = !currentValid ? 0 : (cur & 0x8000u) ? (int)(((~cur & 0xffffu) + 1u) * 1000u >> 12) :
++	    -(int)(((cur & 0x7fffu) * 1000u) >> 12);
++	/* ponytail: on power only while it charges, a full battery on the cable reads as unplugged; the s2mu106 charger (i2c 0x3d) knows better */
++	bool charging = ma > 20;
++	publish(percent, mv, ma, charging, charging, charging, percent == 100 && charging, true, currentValid);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fGauge) {
++		pollGauge();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+ 	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+ 	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    readWord(false, 0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+ 	    !sweet_spmi_read(0, 0x1310, &usb) &&
+ 	    !sweet_spmi_read(0, 0x110b, &path) &&
+ 	    !sweet_spmi_read(0, 0x1006, &charger) &&
+@@ -235,7 +270,7 @@ SweetBattery::poll(void)
+ 	uint8_t subtype;
+ 	uint16_t rawCurrent;
+ 	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
++	    (subtype == 3 || subtype == 4) && readWord(false, 0x48c2, &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+@@ -264,7 +299,8 @@ SweetBattery::start(IOService *provider)
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fGauge = real == 2;
++	fReal = fGauge || (real == 1 && sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -275,7 +311,7 @@ SweetBattery::start(IOService *provider)
+ 			fRunning = true;
+ 			fTimer->setTimeoutMS(30000);
+ 		} else {
+-			fReal = false;
++			fReal = fGauge = false;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
