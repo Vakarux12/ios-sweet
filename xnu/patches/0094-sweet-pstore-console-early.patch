@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2c39f0f..58a24de 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -585,7 +585,7 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 
+ /* also called by IOFindBSDRoot for a non ufs root, so only once */
+ void sweet_input_start(void);
+-static void sweet_prz_start(void);
++void sweet_prz_start(void);
+ static void sweet_ufs_probe(void);
+ 
+ void
+@@ -794,14 +794,15 @@ sweet_log_append(const char *c, int size)
+ /*
+  * boot-arg sweetprz=<phys> also keeps the console in a linux ramoops console
+  * zone of 256 KiB there, so after a warm reset recovery shows it as
+- * /sys/fs/pstore/console-ramoops-0 (a71: sweetprz=0xa1340000)
++ * /sys/fs/pstore/console-ramoops-0 (a71: sweetprz=0xa1340000). the platform
++ * expert starts it before the drivers, sweet_input_start again for safety
+  */
+-static void
++void
+ sweet_prz_start(void)
+ {
+ 	uint64_t pa = 0;
+ 
+-	if (!PE_parse_boot_argn("sweetprz", &pa, sizeof(pa)) || !pa) {
++	if (sweet_prz || !PE_parse_boot_argn("sweetprz", &pa, sizeof(pa)) || !pa) {
+ 		return;
+ 	}
+ 	volatile struct sweet_prz *z = (volatile struct sweet_prz *)ml_io_map(pa, sizeof(*z));
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..508ad0f 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,8 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++extern "C" void sweet_prz_start(void);  /* bsd/dev/sweet_ufs.c */
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -25,6 +27,8 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
++	/* console into pstore before any driver starts, so an early hang leaves a log */
++	sweet_prz_start();
+ 	IOLog("SWEET: starting device-tree platform expert\n");
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
