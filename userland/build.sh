@@ -3,6 +3,7 @@
 #   out/libOSMesa.8.dylib      mesa 25.0.7 freedreno + softpipe behind osmesa
 #   out/libtopaz-gl.dylib      eagl.c, the EAGLContext coreanimation draws with
 #   out/libtopaz-inject.dylib  loads libtopaz-gl in backboardd when RedwoodGPU is up
+#   out/RedwoodAudio.driver    hal plug-in for mediaserverd, its "Actuator" feeds /dev/redwood-haptic
 # all go to /topaz/lib on the phone, boot-arg topaz_inject=/topaz/lib/libtopaz-inject.dylib,backboardd
 set -e
 VERSION=25.0.7
@@ -66,6 +67,9 @@ DYN=("$CC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O1)
 	"$ROOT/gpu/eagl.c" "$ROOT/gpu/gl_osmesa.c"
 "${DYN[@]}" -dynamiclib -install_name /topaz/lib/libtopaz-inject.dylib -framework CoreFoundation \
 	-framework IOKit -lobjc -o "$O/libtopaz-inject.dylib" "$ROOT/gpu/topaz_inject.c"
+mkdir -p "$O/RedwoodAudio.driver"
+"${DYN[@]}" -bundle -framework CoreFoundation -o "$O/RedwoodAudio.driver/RedwoodAudio" "$ROOT/audio/audio_plugin.c"
+cp "$ROOT/audio/audio_plugin.plist" "$O/RedwoodAudio.driver/Info.plist"
 # install_name_tool broke the linker signature
-codesign -f -s - "$O"/*.dylib
-cd "$O" && shasum -a 256 *.dylib > SHA256SUMS && ls -l
+codesign -f -s - "$O"/*.dylib "$O/RedwoodAudio.driver/RedwoodAudio"
+cd "$O" && shasum -a 256 *.dylib RedwoodAudio.driver/* > SHA256SUMS && ls -l . RedwoodAudio.driver
