@@ -1,0 +1,36 @@
+name: userland
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, a71-xnu]
+    paths:
+      - "userland/**"
+      - ".github/workflows/userland.yml"
+
+concurrency:
+  group: userland-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          brew install bison
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build
+        run: bash userland/build.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: userland-gl
+          path: userland/out/
+          if-no-files-found: warn
