@@ -1,0 +1,89 @@
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index 829d2b0..dbca25a 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -986,6 +986,7 @@ image_file(const char *name, uint64_t *size)
+ }
+ 
+ #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
++#define MDT_RELOCATABLE         (1u << 27)      /* linux qcom_mdt_loader.c */
+ #define MAX_SEGMENTS            48
+ 
+ struct elf_segment {
+@@ -1033,7 +1034,8 @@ step_firmware(void)
+ 	struct elf_segment segment;
+ 	const uint8_t *header;
+ 	uint64_t size = 0, files = 0;
+-	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
++	uint32_t count, hashes = 0, lowest = ~0u, highest = 0, base = ADSP_MEMORY;
++	bool relocatable = false;
+ 
+ 	announce("find the audio DSP's image in /fw on the root, and check it against its own header");
+ 	image_forget();
+@@ -1050,6 +1052,16 @@ step_firmware(void)
+ 		    header[1], header[2], header[3], count, size);
+ 		goto fail;
+ 	}
++	/* a71: the image is relocatable, linked at 0x93c00000: its lowest segment goes to the region's start */
++	for (uint32_t i = 0; i < count; i++) {
++		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
++		if (segment.type == 1 && !MDT_HASH(segment.flags) && segment.memory_size != 0) {
++			relocatable |= (segment.flags & MDT_RELOCATABLE) != 0;
++			lowest = segment.paddr < lowest ? segment.paddr : lowest;
++		}
++	}
++	base = relocatable ? lowest : ADSP_MEMORY;
++	lowest = ~0u;
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		char name[16];
+ 
+@@ -1060,13 +1072,13 @@ step_firmware(void)
+ 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
+ 			continue;
+ 		}
+-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
+-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
++		if (segment.paddr < base || segment.file_size > segment.memory_size ||
++		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)base + ADSP_MEMORY_SIZE) {
+ 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
+ 			    segment.memory_size);
+ 			goto fail;
+ 		}
+-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
++		image.segment[image.segments].at = segment.paddr - base;
+ 		image.segment[image.segments].file_size = segment.file_size;
+ 		image.segment[image.segments].memory_size = segment.memory_size;
+ 		image.segment[image.segments].file = NULL;
+@@ -1089,17 +1101,17 @@ step_firmware(void)
+ 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
+ 		image.segments++;
+ 	}
+-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
++	if (image.segments == 0 || lowest != base || 52 + 32 * count + (uint64_t)hashes != size) {
+ 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
+ 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
+ 		goto fail;
+ 	}
+ 	image.header = header;
+ 	image.header_size = size;
+-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
++	image.size = ((highest + 0xfff) & ~0xfffu) - base;
+ 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
+-	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
+-	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
++	    "bytes of the DSP's %#x from %#x (linked at %#x)\n", step, from_root ? "from /fw on the root" : "from the small image", size,
++	    hashes, image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY, base);
+ 	return true;
+ fail:
+ 	image_forget();
+@@ -1385,8 +1397,8 @@ step_image(void)
+ 	for (unsigned s = 0; s < image.segments; s++) {
+ 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
+ 
+-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
+-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
++		if (image.segment[s].at & 7) {
++			printf("adsp: %u: a segment that does not begin at a multiple of eight bytes: not written\n", step);
+ 			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
+ 			return false;
+ 		}
