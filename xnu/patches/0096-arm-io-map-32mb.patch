@@ -1,0 +1,14 @@
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+index 18ef2f0..4e65a80 100644
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,8 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/* a71: the gpu ram window alone is 7 MB (A71Adreno.cpp), same as i386 now */
++#define IO_MAP_SIZE            (32ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;

@@ -24,7 +24,7 @@ cp -r "$ROOT/mesa/redwood-drm" mesa-$VERSION/src/redwood-drm
 
 [ -x venv/bin/python3 ] || { python3 -m venv venv && venv/bin/pip -q install meson==1.7.0 ninja mako pyyaml packaging; }
 # mesa wants a newer bison than /usr/bin has
-export PATH=$B/venv/bin:/opt/homebrew/opt/bison/bin:$PATH
+export PATH=$B/venv/bin:/opt/homebrew/opt/bison/bin:/usr/local/opt/bison/bin:$PATH
 cat > cross.ini <<INI
 [binaries]
 c = ['$CC', '-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK']
