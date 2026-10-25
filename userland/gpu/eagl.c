@@ -703,6 +703,37 @@ surface_changed(struct eagl *e, struct image *image)
 	return true;
 }
 
+/* The GPU copies one texture into another of the same size, upside down if asked. */
+static void
+texture_blit(struct eagl *e, GLuint from, GLuint to, GLsizei width, GLsizei height, bool invert)
+{
+	GLint read = 0, draw = 0;
+	GLboolean boxed = glIsEnabled(GL_SCISSOR_TEST);
+
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, from, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, to, 0);
+	if (boxed) {
+		glDisable(GL_SCISSOR_TEST);     /* (a blit is scissored too: the whole picture goes) */
+	}
+	glBlitFramebuffer(0, 0, width, height, 0, invert ? height : 0, width, invert ? 0 : height, GL_COLOR_BUFFER_BIT,
+	    GL_NEAREST);
+	if (boxed) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -716,6 +747,22 @@ surface_to_texture(struct eagl *e, struct image *image)
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
 
 	if (image->shared) {
+		return;
+	}
+	if (image->mirror != 0) {
+		/*
+		 * The mirror is the surface's memory: the GPU copies it in. The processor took 27 ms a
+		 * frame for the 11 MB of a new screen surface (a71h1f), the GPU a blit like the frame's end.
+		 */
+		GLint had_width = 0, had_height = 0;
+
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000, &had_width);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &had_height);
+		if (had_width != image->width || had_height != image->height) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, image->width, image->height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+		}
+		texture_blit(e, image->mirror, image->texture, image->width, image->height, image->invert);
+		image->seed = IOSurfaceGetSeed(surface);
 		return;
 	}
 	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
@@ -824,25 +871,8 @@ target_to_surface(struct eagl *e, struct image *image)
 
 	image->drawn = false;
 	if (image->mirror != 0) {
-		GLint read = 0, draw = 0;
-
 		/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
-		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
-		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
-		if (e->reader == 0) {
-			glGenFramebuffers(1, &e->reader);
-		}
-		if (e->writer == 0) {
-			glGenFramebuffers(1, &e->writer);
-		}
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
-		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
-		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
-		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
-		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+		texture_blit(e, image->texture, image->mirror, image->width, image->height, image->invert);
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
 		}
@@ -3585,7 +3615,9 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
 	began = now_us();
-	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
+	if (surface_mirrored(e, image)) {
+		surface_to_texture(e, image);           /* (by the GPU, from the mirror; its sum is never asked for) */
+	} else if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
