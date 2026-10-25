@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index e726381..2f93f65 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -1580,7 +1580,7 @@ step_start(void)
+ {
+ 	struct smp2p words, last;
+ 	uint64_t answer = ~0ull, started, now, ready_at = 0, limit;
+-	uint32_t state = 0, changes = 0, wait_seconds = 10;
++	uint32_t state = 0, changes = 0, wait_seconds = 10, level = 384;
+ 	int32_t result;
+ 	bool have, spoke = false, handed_over = false;
+ 
+@@ -1597,7 +1597,9 @@ step_start(void)
+ 	doorbells();
+ 	bzero(&doorbell, sizeof(doorbell));
+ 	lck_mtx_lock(&dsp_lock);
+-	if (!rails(0x181)) {                    /* a71 dt: qcom,vdd_cx-uV-uA of qcom,lpass@62400000 */
++	/* a71: android asks 0x181, above the top level rpmh lists (384, turbo): 384. boot-arg adsp_level */
++	PE_parse_boot_argn("adsp_level", &level, sizeof(level));
++	if (!rails(level)) {
+ 		lck_mtx_unlock(&dsp_lock);
+ 		return false;
+ 	}
