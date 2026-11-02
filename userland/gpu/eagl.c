@@ -669,6 +669,8 @@ surface_shared(struct eagl *e, struct image *image)
  * a frame, when the texture is about to be drawn with, the memory is added up, and copied again
  * if the sum has changed.
  */
+#define STILL_LOOKS     120
+static unsigned still_every = 8;        /* boot-arg glstill=N, 0 sums every frame */
 static bool
 surface_changed(struct eagl *e, struct image *image)
 {
@@ -681,11 +683,8 @@ surface_changed(struct eagl *e, struct image *image)
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
-	/*
-	 * Adding up 11 MB was 3-4 ms a frame (glBindTexture). A memory whose sum has stayed the
-	 * same for 30 looks in a row is added up every 2nd frame only, until it changes again (8 made app launches lag).
-	 */
-	if (image->quiet >= 30 && image->looked != 0 && e->frames + 1 - image->looked < 2) {
+	/* still for 120 looks: summed every Nth frame only, spread by surface id (hackios 759b620) */
+	if (still_every > 1 && image->quiet >= STILL_LOOKS && (e->frames + IOSurfaceGetID(surface)) % still_every != 0) {
 		return false;
 	}
 	image->looked = e->frames + 1;
@@ -695,7 +694,7 @@ surface_changed(struct eagl *e, struct image *image)
 		sum ^= sum >> 29;
 	}
 	if (sum == image->sum) {
-		image->quiet++;
+		image->quiet += image->quiet < STILL_LOOKS;
 		return false;
 	}
 	image->sum = sum;
@@ -3735,6 +3734,9 @@ install(void)
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
+		if ((argument = strstr(arguments, "glstill=")) != NULL) {
+			still_every = (unsigned)strtoul(argument + 8, NULL, 10);
+		}
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);
 		}
