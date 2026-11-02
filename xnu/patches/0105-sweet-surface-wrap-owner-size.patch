@@ -1,0 +1,31 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e01814a..72b7bfd 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1448,6 +1448,14 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
+ 			return kIOReturnBadArgument;
+ 		}
+ 		size = (uint64_t)bpr * height;
++		/* +0x1c is the owner's size, a mask's last row only as long as it is wide (hackios 759b620) */
++		uint32_t owned = 0;
++		if (args->structureInputSize >= 0x20) {
++			memcpy(&owned, in + 0x1c, 4);
++		}
++		if (owned != 0 && owned < size && owned >= (uint64_t)bpr * (height - 1) + (uint64_t)width * bpe) {
++			size = owned;
++		}
+ 	} else {
+ 		if (args->scalarInputCount < 2) {
+ 			return kIOReturnBadArgument;
+@@ -1468,6 +1476,11 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
+ 	}
+ 	IOReturn wret = sweet_surface_use_task_memory(s, fTask, address, size);
+ 	if (wret != kIOReturnSuccess) {
++		static uint32_t failed;
++		if (failed++ < 6 || failed % 1000 == 0) {
++			IOLog("SWEET SURF: wrap %s failed %u: %#llx %llu bytes %ux%u bpr %u -> 0x%x\n",
++			    selector == kSweetSurfaceWrapClientImage ? "image" : "memory", failed, address, size, width, height, bpr, wret);
++		}
+ 		s->release();
+ 		return wret;
+ 	}
