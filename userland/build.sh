@@ -61,7 +61,7 @@ nm -gU "$O/libOSMesa.8.dylib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > expo
 python3 "$ROOT/mkeagl.py" "$ROOT/eagl_slots.txt" mesa-$VERSION/src/mapi/glapi/registry/gl.xml exported-gl.txt \
 	"$ROOT/gpu/eagl.c" > eagl_gen.h
 
-DYN=("$CC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O1)
+DYN=("$CC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2)
 "${DYN[@]}" -dynamiclib -install_name /topaz/lib/libtopaz-gl.dylib -I"$B" -framework CoreFoundation \
 	-framework IOKit -framework IOSurface -lobjc "$O/libOSMesa.8.dylib" -o "$O/libtopaz-gl.dylib" \
 	"$ROOT/gpu/eagl.c" "$ROOT/gpu/gl_osmesa.c"

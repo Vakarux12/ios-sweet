@@ -235,6 +235,7 @@ struct image {
 	bool sub_ok;                    /* ... refilled with glTexSubImage2D (until that fails) */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
+	unsigned seed_frame;             /* the frame whose binds already asked the seed */
 	GLsizei width, height;
 };
 
@@ -250,6 +251,14 @@ struct eagl {
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
+	GLuint gl_program;              /* the one bound in the library now (use_program) */
+	/* state the draws ask about, kept as it is set (gs_*, glthread=1) */
+	bool gs_known;
+	GLint gs_viewport[4], gs_scissor[4];
+	bool gs_scissor_on, gs_blend_on;
+	GLint gs_blend[4];
+	bool gs_attrib_on[4];
+	GLfloat gs_clear[4];
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
 	GLuint vibrant, masking;        /* two more: what a colour matrix does to what is behind, and to the layer */
@@ -327,6 +336,239 @@ static int trace_listed;                        /* the draw at hand is one of th
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
+
+/*
+ * from ios-sapphire (c8f3367, 86996ea): the program bound is remembered per context and only a
+ * different one is handed on, a program change is the library's dearest. with glthread=1 the
+ * state the draws ask about is kept here too, a glGet makes mesa's glthread wait for its queue.
+ */
+static int gs_on;                               /* boot-arg glthread=1 */
+#ifndef GL_SCISSOR_TEST
+#define GL_SCISSOR_TEST                 0x0c11
+#endif
+#ifndef GL_VIEWPORT
+#define GL_VIEWPORT                     0x0ba2
+#endif
+#ifndef GL_SCISSOR_BOX
+#define GL_SCISSOR_BOX                  0x0c10
+#endif
+#ifndef GL_COLOR_CLEAR_VALUE
+#define GL_COLOR_CLEAR_VALUE            0x0c22
+#endif
+#ifndef GL_BLEND
+#define GL_BLEND                        0x0be2
+#endif
+#ifndef GL_BLEND_DST_RGB
+#define GL_BLEND_DST_RGB                0x80c8
+#endif
+#ifndef GL_BLEND_SRC_RGB
+#define GL_BLEND_SRC_RGB                0x80c9
+#endif
+#ifndef GL_BLEND_SRC_ALPHA
+#define GL_BLEND_SRC_ALPHA              0x80cb
+#endif
+#ifndef GL_BLEND_DST_ALPHA
+#define GL_BLEND_DST_ALPHA              0x80ca
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_ENABLED
+#define GL_VERTEX_ATTRIB_ARRAY_ENABLED  0x8622
+#endif
+
+static void
+gs_learn(struct eagl *e)
+{
+	GLint on;
+
+	if (e->gs_known) {
+		return;
+	}
+	glGetIntegerv(GL_VIEWPORT, e->gs_viewport);
+	glGetIntegerv(GL_SCISSOR_BOX, e->gs_scissor);
+	e->gs_scissor_on = glIsEnabled(GL_SCISSOR_TEST);
+	e->gs_blend_on = glIsEnabled(GL_BLEND);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &e->gs_blend[0]);
+	glGetIntegerv(GL_BLEND_DST_RGB, &e->gs_blend[1]);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &e->gs_blend[2]);
+	glGetIntegerv(GL_BLEND_DST_ALPHA, &e->gs_blend[3]);
+	for (GLuint i = 0; i < 4; i++) {
+		glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+		e->gs_attrib_on[i] = on != 0;
+	}
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, e->gs_clear);
+	e->gs_known = true;
+}
+
+static inline struct eagl *
+gs_context(void)
+{
+	return gs_on ? current : NULL;
+}
+
+static inline void
+gs_clear_colour(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
+{
+	struct eagl *e = gs_context();
+
+	glClearColor(r, g, b, a);
+	if (e != NULL && e->gs_known) {
+		e->gs_clear[0] = r, e->gs_clear[1] = g, e->gs_clear[2] = b, e->gs_clear[3] = a;
+	}
+}
+
+static void
+gs_get_integer(GLenum name, GLint *values)
+{
+	struct eagl *e = gs_context();
+	const GLint *kept = NULL;
+	unsigned n = 1;
+
+	if (e != NULL) {
+		gs_learn(e);
+		switch (name) {
+		case GL_VIEWPORT: kept = e->gs_viewport; n = 4; break;
+		case GL_SCISSOR_BOX: kept = e->gs_scissor; n = 4; break;
+		case GL_BLEND_SRC_RGB: kept = &e->gs_blend[0]; break;
+		case GL_BLEND_DST_RGB: kept = &e->gs_blend[1]; break;
+		case GL_BLEND_SRC_ALPHA: kept = &e->gs_blend[2]; break;
+		case GL_BLEND_DST_ALPHA: kept = &e->gs_blend[3]; break;
+		}
+	}
+	if (kept == NULL) {
+		glGetIntegerv(name, values);
+		return;
+	}
+	memcpy(values, kept, n * sizeof(GLint));
+}
+
+static GLboolean
+gs_is_enabled(GLenum cap)
+{
+	struct eagl *e = gs_context();
+
+	if (e != NULL && (cap == GL_SCISSOR_TEST || cap == GL_BLEND)) {
+		gs_learn(e);
+		return cap == GL_SCISSOR_TEST ? e->gs_scissor_on : e->gs_blend_on;
+	}
+	return glIsEnabled(cap);
+}
+
+static void
+gs_get_float(GLenum name, GLfloat *values)
+{
+	struct eagl *e = gs_context();
+
+	if (e != NULL && name == GL_COLOR_CLEAR_VALUE) {
+		gs_learn(e);
+		memcpy(values, e->gs_clear, sizeof(e->gs_clear));
+		return;
+	}
+	glGetFloatv(name, values);
+}
+
+static void
+gs_get_attrib(GLuint index, GLenum name, GLint *value)
+{
+	struct eagl *e = gs_context();
+
+	if (e != NULL && name == GL_VERTEX_ATTRIB_ARRAY_ENABLED && index < 4) {
+		gs_learn(e);
+		*value = e->gs_attrib_on[index];
+		return;
+	}
+	glGetVertexAttribiv(index, name, value);
+}
+
+static inline void
+gs_enable(GLenum cap, bool on)
+{
+	struct eagl *e = gs_context();
+
+	if (on) {
+		glEnable(cap);
+	} else {
+		glDisable(cap);
+	}
+	if (e != NULL && e->gs_known) {
+		if (cap == GL_SCISSOR_TEST) {
+			e->gs_scissor_on = on;
+		} else if (cap == GL_BLEND) {
+			e->gs_blend_on = on;
+		}
+	}
+}
+
+static inline void
+gs_viewport(GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	struct eagl *e = gs_context();
+
+	glViewport(x, y, width, height);
+	if (e != NULL && e->gs_known) {
+		e->gs_viewport[0] = x, e->gs_viewport[1] = y, e->gs_viewport[2] = width, e->gs_viewport[3] = height;
+	}
+}
+
+static inline void
+gs_scissor(GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	struct eagl *e = gs_context();
+
+	glScissor(x, y, width, height);
+	if (e != NULL && e->gs_known) {
+		e->gs_scissor[0] = x, e->gs_scissor[1] = y, e->gs_scissor[2] = width, e->gs_scissor[3] = height;
+	}
+}
+
+static inline void
+gs_blend_func(GLenum source, GLenum destination, GLenum source_alpha, GLenum destination_alpha)
+{
+	struct eagl *e = gs_context();
+
+	glBlendFuncSeparate(source, destination, source_alpha, destination_alpha);
+	if (e != NULL && e->gs_known) {
+		e->gs_blend[0] = (GLint)source, e->gs_blend[1] = (GLint)destination;
+		e->gs_blend[2] = (GLint)source_alpha, e->gs_blend[3] = (GLint)destination_alpha;
+	}
+}
+
+static inline void
+gs_attrib(GLuint index, bool on)
+{
+	struct eagl *e = gs_context();
+
+	if (on) {
+		glEnableVertexAttribArray(index);
+	} else {
+		glDisableVertexAttribArray(index);
+	}
+	if (e != NULL && e->gs_known && index < 4) {
+		e->gs_attrib_on[index] = on;
+	}
+}
+
+static inline void
+use_program(struct eagl *e, GLuint program)
+{
+	if (e->gl_program != program) {
+		e->gl_program = program;
+		glUseProgram(program);
+	}
+}
+
+#define glEnable(cap)                           gs_enable((cap), true)
+#define glDisable(cap)                          gs_enable((cap), false)
+#define glViewport(x, y, w, h)                  gs_viewport((x), (y), (w), (h))
+#define glScissor(x, y, w, h)                   gs_scissor((x), (y), (w), (h))
+#define glBlendFunc(s, d)                       gs_blend_func((s), (d), (s), (d))
+#define glBlendFuncSeparate(s, d, sa, da)       gs_blend_func((s), (d), (sa), (da))
+#define glEnableVertexAttribArray(i)            gs_attrib((i), true)
+#define glDisableVertexAttribArray(i)           gs_attrib((i), false)
+#define glClearColor(r, g, b, a)                gs_clear_colour((r), (g), (b), (a))
+#define glGetIntegerv(name, values)             gs_get_integer((name), (values))
+#define glIsEnabled(cap)                        gs_is_enabled(cap)
+#define glGetFloatv(name, values)               gs_get_float((name), (values))
+#define glGetVertexAttribiv(i, name, value)     gs_get_attrib((i), (name), (value))
+#define glUseProgram(p)                         use_program(e, (p))
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* topaz: time spent in each entry */
@@ -671,6 +913,17 @@ surface_shared(struct eagl *e, struct image *image)
  */
 #define STILL_LOOKS     120
 static unsigned still_every = 8;        /* boot-arg glstill=N, 0 sums every frame */
+/* the seed asked once a frame per picture, each ask is a trip into the kernel (from ios-sapphire 86996ea) */
+static bool
+seed_moved(struct eagl *e, struct image *image)
+{
+	if (image->seed_frame == e->frames + 1) {
+		return false;
+	}
+	image->seed_frame = e->frames + 1;
+	return IOSurfaceGetSeed(image->surface) != image->seed;
+}
+
 static bool
 surface_changed(struct eagl *e, struct image *image)
 {
@@ -1190,7 +1443,7 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 		e->bound[e->unit] = texture;
 	}
 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
-	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
+	    (!image->target ? seed_moved(e, image) || surface_changed(e, image) :
 	    image->wrapped && !image->painted && surface_changed(e, image))) {
 		surface_to_texture(e, image);
 	}
@@ -1928,8 +2181,8 @@ vblur_level(struct eagl *e, int from)
 	/* back as it was */
 	glBindTexture(GL_TEXTURE_2D, picture);
 	glUseProgram(0);
-	(blended ? glEnable : glDisable)(GL_BLEND);
-	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_BLEND, blended);
+	gs_enable(GL_SCISSOR_TEST, scissored);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glViewport(view[0], view[1], view[2], view[3]);
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
@@ -1956,12 +2209,12 @@ clear_now(struct eagl *e)
 	boxed = glIsEnabled(GL_SCISSOR_TEST);
 	glGetIntegerv(GL_SCISSOR_BOX, box);
 	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
-	(e->unclear_boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_SCISSOR_TEST, e->unclear_boxed);
 	glScissor(e->unclear_box[0], e->unclear_box[1], e->unclear_box[2], e->unclear_box[3]);
 	glClearColor(e->unclear_colour[0], e->unclear_colour[1], e->unclear_colour[2], e->unclear_colour[3]);
 	glClear(e->unclear);
 	e->unclear = 0;
-	(boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_SCISSOR_TEST, boxed);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glClearColor(colour[0], colour[1], colour[2], colour[3]);
 }
@@ -2444,15 +2697,15 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		glVertexAttribPointer(0, e->arrays[0].size, e->arrays[0].type, 0, e->arrays[0].stride, e->arrays[0].pointer);
 		for (GLuint i = 0; i < 3; i++) {
-			(enabled[i] ? glEnableVertexAttribArray : glDisableVertexAttribArray)(i);
+			gs_attrib(i, enabled[i]);
 		}
 		glUseProgram(e->program);
-		(blending ? glEnable : glDisable)(GL_BLEND);
+		gs_enable(GL_BLEND, blending);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
 	glViewport(view[0], view[1], view[2], view[3]);
 	glScissor(box[0], box[1], box[2], box[3]);
-	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	gs_enable(GL_SCISSOR_TEST, scissored);
 }
 
 /* A texture's contents are made anew (an upload, a copy into it): whatever it held is gone. */
@@ -2612,7 +2865,7 @@ group_draw_end(struct eagl *e, const GLint enabled[4])
 			glDisableVertexAttribArray(i);
 		}
 	}
-	(e->group_blend ? glEnable : glDisable)(GL_BLEND);
+	gs_enable(GL_BLEND, e->group_blend);
 	glBlendFuncSeparate((GLenum)e->group_blend_func[0], (GLenum)e->group_blend_func[1], (GLenum)e->group_blend_func[2],
 	    (GLenum)e->group_blend_func[3]);
 	glUseProgram(e->program);
@@ -2798,7 +3051,7 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 		glActiveTexture(GL_TEXTURE0 + e->unit);
 		e->vblur_bound = false;
 	}
-	glUseProgram(0);
+	/* our program stays bound, the next draw of CoreAnimation's binds its own first */
 	if (e->blended) {
 		glEnable(GL_BLEND);
 		e->blended = 0;
@@ -2892,6 +3145,9 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		if (!plain) {
+			use_program(e, e->program);
+		}
 		glDrawArrays(mode, first, count);
 		if (plain) {
 			plain_draw_end(e, enabled);
@@ -2930,6 +3186,9 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		if (!plain) {
+			use_program(e, e->program);
+		}
 		glDrawElements(mode, count, type, indices);
 		if (plain) {
 			plain_draw_end(e, enabled);
@@ -3442,6 +3701,9 @@ my_glDeleteProgram(void *context, GLuint name)
 	EAGL_ENTER(e, 0x1280);
 	if (glIsProgram(name)) {
 		glDeleteProgram(name);
+		if (e->gl_program == name) {
+			e->gl_program = ~0u;
+		}
 	} else {
 		glDeleteShader(name);
 	}
@@ -3734,6 +3996,11 @@ install(void)
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
+		if (strstr(arguments, "glthread=1") != NULL && strcmp(getprogname(), "backboardd") == 0) {
+			setenv("mesa_glthread", "true", 1);
+			gs_on = 1;
+			say("redwood-gl: mesa's glthread on\n");
+		}
 		if ((argument = strstr(arguments, "glstill=")) != NULL) {
 			still_every = (unsigned)strtoul(argument + 8, NULL, 10);
 		}
